@@ -77,3 +77,34 @@ XE2_KV_LIB=/path/new.so XE2_KV_PARTIAL_FP16=1 python bench/ab_attention.py \
 python bench/bench_matrix.py --out results.jsonl --prefill-lens 2048,8192,32768 \
     --decode-lens 8192,32768 --conc 1,2,4                                                   # endpoint matrix
 ```
+
+- Single-GPU (TP1) replicas, same build: prefill 1.65K tok/s per GPU (2K-8K), 1.37K at 32K, decode C1 70 / 67 / 57 tok/s at
+  8K / 24K / 48K; with both GPUs running independently the interference is at most about 4% and the aggregate
+  prefill of two simultaneous prompts is about 3.4K tok/s. A TP1 replica holds only about 75K tokens of KV
+  (weights 15.04 GiB), so contexts above that need TP2.
+- Prefill all-reduce experiments (two ranks, 43 MB message): fp16 all-reduce 5.85 ms; an eager int8-payload
+  variant 12.06 ms (slower; max error 1.3% of row max); an async all-reduce overlapped with a GEMM takes
+  10.36 ms against 10.10 ms serial, i.e. no overlap on this stack. A single-prompt prefill above about 2.4K tok/s
+  would need a fused exchange kernel and a real overlap mechanism.
+- Loading: the model on the HDD loads at about 57 MB/s; a copy on an SSD loads in about 7 minutes for TP2.
+
+## Update: sub-group-parallel S1 for the 1-token draft (bit-exact)
+
+For `q_len * GQA <= 8` the generic kernel leaves 7 of 8 sub-groups idle while sub-group 0 does all QK, softmax
+and PV work. The new variant spreads one page over all 8 (QK by 16-token tile on 4 sub-groups, softmax by row,
+PV by 16-column tile) with a work-group barrier at every cross-sub-group hand-off, including the last S read
+before the V tile overwrites S. Every element is accumulated in the same order, so the output is bit-identical.
+On by default; `XE2_KV_SMALL_S1=0` disables it. Only with the parallel S2 merge.
+
+| q1 draft op, one rank, graph replay | before | after | change |
+|---|---:|---:|---:|
+| 8001 tokens, C1 / C2 | 155.7 / 233.2 us | 121.8 / 171.9 us | -22% / -26% |
+| 131072 tokens, C1 / C2 | 767.7 / 1499.5 us | 578.0 / 1088.9 us | -25% / -27% |
+
+Maximum absolute difference to the previous kernel is 0.0 on all cases (partial last page included). The
+q7 verify op is unchanged within noise. The repository's XPU kernel tests pass (6/6, both head layouts).
+End to end the decode cycle shortens by 0% (8K) to 3% (200K C1) over the fp16-partials build, which matches
+the 6 draft steps per cycle (about 1 to 2.5 ms at long context).
+
+A 6-row-block version of the same idea for the q7 verify op is correct but 5% to 7% slower (more accumulators,
+only 4 sub-groups issue the QK matmul), so it is not included.
