@@ -401,7 +401,7 @@ def _runtime_mlp_fake(x, packed, scales, zeros, group_size, bias):
 # product is rounded to the activation dtype before quantizing, as the
 # unfused SiLU-and-mul output is. Rows at or below SMALL_M_MAX take vLLM's
 # silu_and_mul op and the library w4a16 GEMM.
-FUSIONS = ("silu",)
+FUSIONS = ("silu", "gnorm")
 _FUSED = frozenset()
 _SILU_COMPILED = None
 
@@ -477,6 +477,70 @@ def _install_silu_mlp(cls) -> None:
     cls.forward = forward
 
 
+# K8V4_W4A8_FUSED=gnorm (also needs gdn in K8V4_W4A8_LAYERS): a GDN layer's
+# gated RMSNorm (vLLM's RMSNormGated.forward_static, per head, gate after the
+# norm) and the grouped int8 quantization of out_proj's input in one
+# compiled function inside out_proj's op, so the normed [tokens, value_dim]
+# output is not written out and read back.
+_GNORM_STATIC = None
+_GNORM_COMPILED = None
+
+
+def _gnorm(o, z, weight, eps: float, activation: str):
+    out = _GNORM_STATIC(o, z, weight, eps, o.dtype, None, True, activation)
+    return out.reshape(out.shape[0], -1)
+
+
+def _gnorm_quantize_grouped(o, z, weight, eps: float, activation: str, group: int):
+    return _quantize_grouped(_gnorm(o, z, weight, eps, activation), group)
+
+
+def _gnorm_body(o, z, weight, eps, activation, packed, scales, zeros, group_size):
+    if not (_RUNTIME_ENABLED and _AGROUP and o.shape[0] > SMALL_M_MAX):
+        return _runtime_mlp_body(_gnorm(o, z, weight, eps, activation), packed, scales, zeros,
+                                 group_size, None)
+    global _GNORM_COMPILED
+    if _GNORM_COMPILED is None:
+        _GNORM_COMPILED = torch.compile(_gnorm_quantize_grouped, dynamic=True, fullgraph=True)
+    quant_x, x_scale = _GNORM_COMPILED(o, z, weight, eps, activation, _AGROUP)
+    out = _lib().int4_gemm_w4a8(quant_x, x_scale, None, packed, scales, None, group_size, None,
+                                o.dtype == torch.bfloat16)
+    return out if out.dtype == o.dtype else out.to(dtype=o.dtype)
+
+
+@torch.library.custom_op("k8v4_prefill::gnorm_gemm", mutates_args=())
+def runtime_gnorm_gemm(o: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float,
+                       activation: str, packed: torch.Tensor, scales: torch.Tensor,
+                       zeros: torch.Tensor, group_size: int) -> torch.Tensor:
+    return _gnorm_body(o, z, weight, eps, activation, packed, scales, zeros, group_size)
+
+
+@runtime_gnorm_gemm.register_fake
+def _runtime_gnorm_fake(o, z, weight, eps, activation, packed, scales, zeros, group_size):
+    return o.new_empty((o.shape[0], packed.shape[1]))
+
+
+def _install_gnorm(cls) -> None:
+    """Route a marked GDN output projection (out_proj._k8v4_gnorm_kernel) through the fused op."""
+    current = cls._output_projection
+    if getattr(current, "_k8v4_gnorm", False):
+        return
+
+    def _output_projection(self, core_attn_out, z):
+        proj, norm = self.out_proj, self.norm
+        kernel = getattr(proj, "_k8v4_gnorm_kernel", None)
+        if (kernel is None or norm.group_size is not None or not norm.norm_before_gate
+                or getattr(norm, "bias", None) is not None or core_attn_out.dim() != 3):
+            return current(self, core_attn_out, z)
+        packed, scales, zeros = _compile_safe_views(kernel, proj)
+        return runtime_gnorm_gemm(core_attn_out, z, norm.weight, float(norm.eps), norm.activation,
+                                  packed, scales, zeros, int(kernel.config.group_size))
+
+    _output_projection._k8v4_gnorm = True
+    _output_projection._k8v4_orig = current
+    cls._output_projection = _output_projection
+
+
 def _install_on_class(cls) -> None:
     global _ORIG_APPLY
     current = cls.apply_weights
@@ -529,6 +593,9 @@ def _install_s4_loader(cls) -> None:
         if ("silu" in _FUSED and _AGROUP and prefix.endswith(".mlp.down_proj")
                 and getattr(layer, "tp_size", 1) == 1):
             layer._k8v4_silu_kernel = self
+        if ("gnorm" in _FUSED and _AGROUP and prefix.endswith(".linear_attn.out_proj")
+                and getattr(layer, "tp_size", 1) == 1):
+            layer._k8v4_gnorm_kernel = self
 
     process_weights_after_loading._k8v4_s4 = True
     cls.process_weights_after_loading = process_weights_after_loading
@@ -628,7 +695,7 @@ def remove_import_hook(finder=None) -> None:
 
 def install_if_requested() -> None:
     """Install before model compilation; cached opaque calls honor opt-out too."""
-    global _RUNTIME_ENABLED, _LAYERS, _KERNEL, _AGROUP, _FUSED
+    global _RUNTIME_ENABLED, _LAYERS, _KERNEL, _AGROUP, _FUSED, _GNORM_STATIC
     mode = os.environ.get("K8V4_PREFILL_GEMM", "w4a16")
     if mode not in ("w4a16", "w4a8"):
         raise RuntimeError("K8V4_PREFILL_GEMM must be w4a16 or w4a8")
@@ -654,6 +721,13 @@ def install_if_requested() -> None:
 
             _install_silu_mlp(qwen2_moe.Qwen2MoeMLP)
             sys.stderr.write("k8v4_w4a8: SiLU-and-mul fused into the down projections' quantizer\n")
+        if "gnorm" in _FUSED:
+            from vllm.model_executor.layers.layernorm import RMSNormGated
+            from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn
+
+            _GNORM_STATIC = RMSNormGated.forward_static
+            _install_gnorm(qwen_gdn_linear_attn.QwenGatedDeltaNetAttention)
+            sys.stderr.write("k8v4_w4a8: GDN gated norm fused into out_proj's quantizer\n")
         if _LAYERS == frozenset(("mlp",)):
             sys.stderr.write("k8v4_w4a8: MLP-only installer active; small-M runtime gate=128\n")
         else:
