@@ -54,13 +54,29 @@ def load_ids(path: str, vocab_size: int) -> list[int]:
     return sorted(ids)
 
 
+def int4_form(head, w_zp) -> str:
+    """``u4`` (one scalar zero point 8) or ``s4`` (W4A8 onednn flip: empty zero point)."""
+    if w_zp is not None and w_zp.numel() == 0 and getattr(head, "_k8v4_s4", False):
+        return "s4"
+    if w_zp is not None and w_zp.numel() == 1:
+        return "u4"
+    raise RuntimeError(
+        "%s: only the symmetric int4 head is supported (zero point %s)"
+        % (ENV_NAME, None if w_zp is None else tuple(w_zp.shape))
+    )
+
+
 def _gptq_rows(head, ids):
     """Row subset of an XPU wNa16 GPTQ head, or None when the head is not one.
 
     After vLLM's XPUwNa16 process_weights_after_loading the packed weight is
     [N, K/8] (output rows first) and the scales [K/group, N]; the op takes
-    the weight transposed. Only the symmetric form (one scalar zero point)
-    is taken.
+    the weight transposed. Two forms are taken (``int4_form``): the stock
+    symmetric one (one scalar zero point 8, u4 nibbles, the stock op), and
+    the s4 form that ``K8V4_W4A8_KERNEL=onednn`` leaves after load (same
+    packing with every nibble XOR 0x8, an empty zero point, the k8v4_w4a8
+    library op). The subset GEMM is the op the head itself decodes with, on
+    the same packed rows and scales.
     """
     import torch
 
@@ -75,13 +91,16 @@ def _gptq_rows(head, ids):
         raise RuntimeError(
             "%s: unexpected int4 head layout q%s s%s" % (ENV_NAME, tuple(w_q.shape), tuple(w_s.shape))
         )
-    if w_zp is None or w_zp.numel() != 1:
-        raise RuntimeError("%s: only the symmetric int4 head is supported" % ENV_NAME)
+    form = int4_form(head, w_zp)
     q = w_q.index_select(0, ids).contiguous()
     s = w_s.index_select(1, ids).contiguous()
 
-    def gemm(x):
-        return torch.ops._xpu_C.int4_gemm_w4a16(x, q.t(), None, s, w_zp, group, None)
+    if form == "s4":
+        def gemm(x):
+            return torch.ops.k8v4_w4a8.int4_gemm_w4a16(x, q.t(), s, None, group)
+    else:
+        def gemm(x):
+            return torch.ops._xpu_C.int4_gemm_w4a16(x, q.t(), None, s, w_zp, group, None)
 
     return gemm, q.numel() * q.element_size() + s.numel() * s.element_size()
 
