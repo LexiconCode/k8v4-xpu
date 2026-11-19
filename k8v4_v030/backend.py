@@ -476,7 +476,9 @@ class Xe2K8V4AttentionBackend(AttentionBackend):
         return Xe2K8V4MetadataBuilder
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[MultipleOf]:
+    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[MultipleOf]:
+        # vLLM 0.34 passes the layer's KV cache spec; 0.30 passes nothing.
+        del kv_cache_spec
         return [MultipleOf(64)]
 
     @classmethod
