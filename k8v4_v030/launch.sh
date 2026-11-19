@@ -62,7 +62,7 @@ if [ -n "${K8V4_W4A8_AGROUP:-}" ]; then
   CACHE_NAMESPACE="${CACHE_NAMESPACE}-agroup-${K8V4_W4A8_AGROUP}"
 fi
 if [ -n "${K8V4_W4A8_FUSED:-}" ]; then
-  [[ "$K8V4_W4A8_FUSED" =~ ^silu$ ]] || { echo "K8V4_W4A8_FUSED must be silu" >&2; exit 2; }
+  [[ "$K8V4_W4A8_FUSED" =~ ^(silu|gnorm)(,(silu|gnorm))?$ ]] || { echo "K8V4_W4A8_FUSED must be silu, gnorm or silu,gnorm" >&2; exit 2; }
   [ "${K8V4_W4A8_KERNEL:-}" = onednn ] && [[ "${K8V4_W4A8_AGROUP:-0}" != 0 ]] || {
     echo "K8V4_W4A8_FUSED needs K8V4_W4A8_KERNEL=onednn and K8V4_W4A8_AGROUP" >&2; exit 2;
   }

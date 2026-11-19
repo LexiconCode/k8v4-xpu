@@ -101,5 +101,45 @@ class ForwardTest(unittest.TestCase):
         self.assertEqual(calls, [128])
 
 
+def _gated_reference(x, z, weight, eps, orig_dtype, group_size=None, norm_before_gate=True, activation="silu"):
+    x, z, w = x.float(), z.float(), weight.float()
+    out = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps) * w
+    return (out * torch.nn.functional.silu(z)).to(orig_dtype)
+
+
+class GnormTest(unittest.TestCase):
+    def test_parse_accepts_gnorm(self):
+        self.assertEqual(gemm.parse_fused("silu,gnorm", "onednn", 64), frozenset(("silu", "gnorm")))
+
+    def test_gnorm_quant_and_dispatch(self):
+        o = torch.randn(200, 4, 128).to(torch.bfloat16)
+        z = torch.randn(200, 4, 128).to(torch.bfloat16)
+        w = torch.rand(128).to(torch.bfloat16)
+        seen = []
+
+        class Ops:
+            @staticmethod
+            def int4_gemm_w4a16(a, b, s, zp, g):
+                seen.append(("w4a16", tuple(a.shape)))
+                return torch.zeros(a.shape[0], b.shape[1], dtype=a.dtype)
+
+            @staticmethod
+            def int4_gemm_w4a8(a, a_s, a_zp, b, s, zp, g, accum, bf16_out):
+                seen.append(("w4a8", tuple(a.shape), tuple(a_s.shape)))
+                return torch.zeros(a.shape[0], b.shape[1], dtype=torch.bfloat16)
+
+        packed = torch.zeros(64, 5, dtype=torch.int32)
+        with patch.object(gemm, "_GNORM_STATIC", _gated_reference), patch.object(gemm, "_lib", lambda: Ops), \
+             patch.object(gemm, "_RUNTIME_ENABLED", True), patch.object(gemm, "_AGROUP", 64), \
+             patch.object(gemm, "_GNORM_COMPILED", gemm._gnorm_quantize_grouped):
+            q, s = gemm._gnorm_quantize_grouped(o, z, w, 1e-6, "silu", 64)
+            q2, s2 = gemm._quantize_grouped(_gated_reference(o, z, w, 1e-6, o.dtype).reshape(200, 512), 64)
+            self.assertTrue(torch.equal(q, q2) and torch.equal(s, s2))
+            gemm._gnorm_body(o, z, w, 1e-6, "silu", packed, torch.ones(1, 5), torch.empty(0, dtype=torch.int8), 128)
+            gemm._gnorm_body(o[:7], z[:7], w, 1e-6, "silu", packed, torch.ones(1, 5),
+                             torch.empty(0, dtype=torch.int8), 128)
+        self.assertEqual(seen, [("w4a8", (200, 512), (200, 8)), ("w4a16", (7, 512))])
+
+
 if __name__ == "__main__":
     unittest.main()
