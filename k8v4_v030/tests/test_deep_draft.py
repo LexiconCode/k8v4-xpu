@@ -37,6 +37,19 @@ class GateTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             deep_draft.mtp_depth({"K8V4_DEEP_MTP_DEPTH": "0"})
 
+    def test_deep_all_parsing(self):
+        self.assertFalse(deep_draft.deep_all({}))
+        self.assertFalse(deep_draft.deep_all({"K8V4_DEEP_ALL": "0"}))
+        self.assertTrue(deep_draft.deep_all({"K8V4_DEEP_ALL": "1", "K8V4_DEEP_DRAFT": "12,16"}))
+        for bad in ({"K8V4_DEEP_ALL": "yes", "K8V4_DEEP_DRAFT": "12,16"}, {"K8V4_DEEP_ALL": "1"}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(RuntimeError):
+                    deep_draft.deep_all(bad)
+
+    def test_deep_all_capture_width_for_every_batch(self):
+        with mock.patch.dict(os.environ, {"K8V4_DEEP_DRAFT": "12,16", "K8V4_DEEP_ALL": "1"}):
+            self.assertEqual(deep_draft.extra_query_lens({16: 1, 4: 4}, 15, 1), {16: 4, 4: 4, 7: 1})
+
     def test_extra_capture_width_only_when_on(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("K8V4_DEEP_DRAFT", None)
@@ -70,6 +83,14 @@ class CopyTest(unittest.TestCase):
             req._all_token_ids = req._all_token_ids + prompt[3:12]
             self.assertEqual(deep_draft.scheduled_depth(sched, {"r": 7}, 15), 15)
             self.assertEqual(deep_draft.scheduled_depth(sched, {"r": 7, "s": 4}, 3), 3)
+        # two requests: deep only with K8V4_DEEP_ALL and only while both copy
+        other = SimpleNamespace(_all_token_ids=prompt + [20, 21, 22, 23, 24, 25], num_output_tokens=6)
+        both = SimpleNamespace(requests={"r": req, "s": other}, num_spec_tokens=15)
+        with mock.patch.dict(os.environ, {"K8V4_DEEP_DRAFT": "4,8", "K8V4_DEEP_ALL": "1"}):
+            self.assertEqual(deep_draft.scheduled_depth(both, {"r": 4, "s": 4}, 3), 3)
+            other._all_token_ids = other._all_token_ids + prompt[20:26]
+            self.assertEqual(deep_draft.scheduled_depth(both, {"r": 4, "s": 4}, 3), 15)
+            self.assertEqual(deep_draft.scheduled_depth(both, {"r": 16, "s": 16}, 3), 15)  # still copying
         off = SimpleNamespace(requests={"r": req})
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("K8V4_DEEP_DRAFT", None)

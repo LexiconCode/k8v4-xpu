@@ -15,6 +15,11 @@ if os.name == 'nt' and Path('C:/Program Files/Git/bin/bash.exe').exists():
     BASH = 'C:/Program Files/Git/bin/bash.exe'
 
 
+def _no_temp(args):
+    """argv without the per-call temporary model and cache paths."""
+    return [x for x in args if '/model:ro' not in x and ':/root/.cache/vllm' not in x]
+
+
 @unittest.skipUnless(BASH, 'Bash is needed to exercise launch.sh')
 class LaunchProfileTest(unittest.TestCase):
     def command(self, **overrides):
@@ -373,6 +378,27 @@ class LaunchProfileTest(unittest.TestCase):
             self.assertIn('K8V4_RSSM_VERIFY=slm', args)
             self.assertIn('K8V4_RSSM_DEFER_COMMIT=1', args)
             self.assertEqual(len(args), len(base) + 4)
+    def test_deep_all_widens_the_capture_list_only_when_set(self):
+        def sizes(args):
+            graph = json.loads(next(x for x in args if x.startswith('--compilation-config=')).split('=', 1)[1])
+            return graph['cudagraph_capture_sizes']
+
+        _, deep = self.command(K8V4_TP='1', K8V4_MAX_SEQS='4', K8V4_DEEP_DRAFT='12,16')
+        self.assertFalse([x for x in deep if x.startswith('K8V4_DEEP_ALL')])
+        result, args = self.command(K8V4_TP='1', K8V4_MAX_SEQS='4', K8V4_DEEP_DRAFT='12,16', K8V4_DEEP_ALL='1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sizes(args), [7, 8, 12, 16, 32, 48, 64])
+        self.assertIn('K8V4_DEEP_ALL=1', args)
+        self.assertEqual(len(args), len(deep) + 2)
+        _, zero = self.command(K8V4_TP='1', K8V4_MAX_SEQS='4', K8V4_DEEP_DRAFT='12,16', K8V4_DEEP_ALL='0')
+        self.assertEqual(_no_temp(zero), _no_temp(deep))
+        _, anyone = self.command(K8V4_TP='1', K8V4_MAX_SEQS='4', K8V4_DEEP_DRAFT='12,16', K8V4_DEEP_ALL='any')
+        self.assertEqual(sizes(anyone), [7, 8, 12, 16, 32, 48, 64])
+        self.assertIn('K8V4_DEEP_ALL=any', anyone)
+        for bad in ({'K8V4_DEEP_ALL': '1'}, {'K8V4_DEEP_DRAFT': '12,16', 'K8V4_DEEP_ALL': 'yes'}):
+            with self.subTest(bad=bad):
+                result, _ = self.command(K8V4_TP='1', K8V4_MAX_SEQS='4', **bad)
+                self.assertEqual(result.returncode, 2)
 
     def test_invalid_gpu_selections_are_rejected_before_launch(self):
         for options in ({'K8V4_TP': '4'}, {'K8V4_TP': '1', 'K8V4_DEVICES': '0,1'},
