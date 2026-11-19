@@ -1,0 +1,100 @@
+"""K8V4_DRAFT_VOCAB: id file contract, the row-subset head (CPU, dense) and the splice."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+from k8v4_v030 import draft_vocab
+
+HAVE_TORCH = importlib.util.find_spec("torch") is not None
+HAVE_VLLM = importlib.util.find_spec("vllm") is not None
+
+_TOOL = Path(__file__).resolve().parents[2] / "tools" / "patch_spec_decode.py"
+_spec = importlib.util.spec_from_file_location("patch_spec_decode", _TOOL)
+patch_tool = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(patch_tool)
+
+SPECULATOR = '''\
+class DraftModelSpeculator:
+    def load_model(self, target_model):
+        target_attn_layer_names = set()
+
+        self.model = self.load_draft_model(target_model, target_attn_layer_names)
+        self._validate_local_argmax_reduction()
+'''
+
+
+def _write(tmp, ids):
+    path = os.path.join(tmp, "ids.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(ids, handle)
+    return path
+
+
+class IdFileTest(unittest.TestCase):
+    def test_unset_is_off(self):
+        self.assertIsNone(draft_vocab.vocab_path({}))
+        self.assertIsNone(draft_vocab.vocab_path({"K8V4_DRAFT_VOCAB": " "}))
+        self.assertFalse(draft_vocab.install(object(), {}))
+
+    def test_ids_are_sorted_unique_and_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(draft_vocab.load_ids(_write(tmp, [5, 1, 5, 3]), 10), [1, 3, 5])
+            for bad in ([], [1, 10], [-1], ["3"], [True], list(range(10)), {"a": 1}):
+                with self.subTest(bad=bad):
+                    with self.assertRaises(RuntimeError):
+                        draft_vocab.load_ids(_write(tmp, bad), 10)
+
+
+@unittest.skipUnless(HAVE_TORCH and HAVE_VLLM, "torch and vLLM are needed")
+class DenseHeadTest(unittest.TestCase):
+    def test_subset_logits_match_the_full_head_on_kept_rows(self):
+        import torch
+
+        torch.manual_seed(0)
+        vocab, hidden = 40, 16
+        head = torch.nn.Linear(hidden, vocab, bias=False)
+        model = SimpleNamespace(
+            lm_head=head,
+            logits_processor=SimpleNamespace(org_vocab_size=vocab, soft_cap=None, scale=1.0, logits_as_input=False),
+        )
+        keep = [0, 3, 7, 8, 20, 39]
+        x = torch.randn(3, hidden)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertTrue(draft_vocab.install(model, {"K8V4_DRAFT_VOCAB": _write(tmp, keep)}))
+        with torch.no_grad():
+            full = head(x)
+            got = model.compute_logits(x)
+            top = model.get_top_tokens(x)
+        self.assertEqual(tuple(got.shape), (3, vocab))
+        self.assertTrue(torch.allclose(got[:, keep], full[:, keep]))
+        drop = [i for i in range(vocab) if i not in keep]
+        self.assertTrue(torch.isinf(got[:, drop]).all())
+        self.assertEqual(top.tolist(), got.argmax(dim=-1).tolist())
+        self.assertTrue(set(top.tolist()) <= set(keep))
+
+
+class SpliceTest(unittest.TestCase):
+    def test_splice_applies_once_and_refuses_unknown_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / patch_tool.SPECULATOR
+            path.parent.mkdir(parents=True)
+            path.write_text(SPECULATOR, encoding="utf-8")
+            self.assertEqual(patch_tool.patch_vllm_tree(root), ["draft_vocab:patched"])
+            self.assertEqual(patch_tool.patch_vllm_tree(root), ["draft_vocab:unchanged"])
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("        _k8v4_draft_vocab(self.model)\n        self._validate_local_argmax_reduction()", text)
+            path.write_text(SPECULATOR.replace("self.load_draft_model(", "self.load_other("), encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                patch_tool.patch_vllm_tree(root)
+
+
+if __name__ == "__main__":
+    unittest.main()
