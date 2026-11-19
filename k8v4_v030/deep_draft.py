@@ -22,7 +22,11 @@ config of ``num_speculative_tokens`` = the deep depth (e.g. 15):
   take their copies and the rest keep MTP drafts in the same step (the MTP
   decode steps are skipped only when every request matched). Our B70 stack
   (-24, B70_DEEP_ALL): all copying, 4 x 8K 380 -> 654 tok/s, 2 x 63K 187 -> 352,
-  ordinary text unchanged.
+  ordinary text unchanged. ``K8V4_DEEP_ALL=any``: the deep depth while ANY
+  request is copying; the MTP decode runs only the batch's MTP depth (e.g. 3)
+  and a request without a copy verifies its MTP drafts plus rejectable filler
+  (one-hot draft logits), so the step stays one uniform width (one decode
+  graph). Copying requests gain the most; writing requests pay the wider verify.
 
 The target verifies every draft token, so outputs are unchanged (lossless).
 Verifying depth 15 needs 16 query rows per request: on the K8/V4 decode
@@ -71,15 +75,24 @@ def mtp_depth(environ: dict[str, str] | None = None) -> int:
     return int(raw)
 
 
-def deep_all(environ: dict[str, str] | None = None) -> bool:
-    """``K8V4_DEEP_ALL=1``: several requests draft deep while all are copying (needs K8V4_DEEP_DRAFT)."""
+def deep_all(environ: dict[str, str] | None = None) -> str:
+    """``K8V4_DEEP_ALL``: "" (unset/0), "all" (1: several requests draft deep while all copy) or "any"."""
     source = os.environ if environ is None else environ
     raw = source.get(ALL_ENV, "0").strip() or "0"
-    if raw not in ("0", "1"):
-        raise RuntimeError("%s must be 0 or 1, got %s" % (ALL_ENV, raw))
-    if raw == "1" and not source.get(ENV_NAME, "").strip():
-        raise RuntimeError("%s=1 needs %s" % (ALL_ENV, ENV_NAME))
-    return raw == "1"
+    if raw not in ("0", "1", "any"):
+        raise RuntimeError("%s must be 0, 1 or any, got %s" % (ALL_ENV, raw))
+    if raw != "0" and not source.get(ENV_NAME, "").strip():
+        raise RuntimeError("%s=%s needs %s" % (ALL_ENV, raw, ENV_NAME))
+    return {"0": "", "1": "all", "any": "any"}[raw]
+
+
+def batch_depth(schedule: Any, num_reqs: int, default: int) -> int:
+    """Draft depth of ``num_reqs`` requests under num_speculative_tokens_per_batch_size."""
+    for row in schedule or ():
+        lo, hi, depth = (int(x) for x in row)
+        if lo <= num_reqs <= hi:
+            return depth
+    return default
 
 
 class CopyTracker:
@@ -146,11 +159,11 @@ def scheduled_depth(scheduler: Any, num_scheduled_tokens: dict, k: int) -> int:
     if state is None:
         rng = ngram_range()
         state = (rng is not None, CopyTracker(rng[0]) if rng else None, mtp_depth() if rng else 0,
-                 bool(rng) and deep_all())
+                 deep_all() if rng else "")
         scheduler._k8v4_deep = state
     on, tracker, depth, every = state
     if on and every and len(num_scheduled_tokens) > 1:
-        return _all_copying_depth(scheduler, tracker, num_scheduled_tokens, k)
+        return _all_copying_depth(scheduler, tracker, num_scheduled_tokens, k, every)
     if not on or len(num_scheduled_tokens) != 1 or not (0 < depth < k):
         return k
     req_id = next(iter(num_scheduled_tokens))
@@ -167,8 +180,9 @@ def scheduled_depth(scheduler: Any, num_scheduled_tokens: dict, k: int) -> int:
     return depth
 
 
-def _all_copying_depth(scheduler: Any, tracker: CopyTracker, num_scheduled_tokens: dict, k: int) -> int:
-    """K8V4_DEEP_ALL: the deep depth when every scheduled request is copying, else ``k``.
+def _all_copying_depth(scheduler: Any, tracker: CopyTracker, num_scheduled_tokens: dict, k: int,
+                       mode: str = "all") -> int:
+    """K8V4_DEEP_ALL: the deep depth when every (``any``: at least one) scheduled request is copying, else ``k``.
 
     Every request is checked each step (the tracker's hold counts steps).
     """
@@ -187,7 +201,7 @@ def _all_copying_depth(scheduler: Any, tracker: CopyTracker, num_scheduled_token
         if tokens is None:
             tokens = request.all_token_ids
         copying.append(tracker.copying(req_id, tokens, request.num_output_tokens > 0))
-    return deep if all(copying) else k
+    return deep if (any(copying) if mode == "any" else all(copying)) else k
 
 
 def extra_query_lens(query_lens: dict, num_speculative_tokens: int, num_new_sampled: int) -> dict:
@@ -243,7 +257,10 @@ def _speculator_class():
                 min_n, max_n, self.num_speculative_steps, self.max_num_reqs, self.max_model_len, device
             )
             self.k8v4_mtp_depth = depth
-            self.k8v4_deep_all = bool(every)
+            self.k8v4_deep_all = every or ""
+            spec = vllm_config.speculative_config
+            self._k8v4_schedule = getattr(spec, "num_speculative_tokens_per_batch_size", None)
+            self._k8v4_mtp_steps = None
             self._pending = None
             self._matched = False
             self.ngram_stats = [0, 0]  # [lookups, full-length matches]
@@ -265,6 +282,16 @@ def _speculator_class():
             self.ngram_stats[1] += self._matched
             return 1 if self._matched else num_speculative_tokens
 
+        def _run_multi_step_decode(self, *args, **kwargs):
+            """K8V4_DEEP_ALL=any: a deep step with unmatched requests runs the batch's MTP depth only."""
+            steps = self._k8v4_mtp_steps
+            if steps is not None:
+                if "num_speculative_steps" in kwargs:
+                    kwargs["num_speculative_steps"] = min(int(kwargs["num_speculative_steps"]), steps)
+                else:
+                    args = args[:-1] + (min(int(args[-1]), steps),)
+            return super()._run_multi_step_decode(*args, **kwargs)
+
         @torch.inference_mode()
         def propose(self, input_batch, attn_metadata, slot_mappings, last_hidden_states, aux_hidden_states,
                     num_sampled, num_rejected, last_sampled, next_prefill_tokens, temperature, seeds,
@@ -280,7 +307,12 @@ def _speculator_class():
             )
             self._pending = None
             self._matched = False
+            self._k8v4_mtp_steps = None
             drafts = has_match = None
+            if use_lookup and self.k8v4_deep_all == "any" and input_batch.num_reqs > 1:
+                steps = batch_depth(self._k8v4_schedule, input_batch.num_reqs, depth)
+                if 0 < steps < depth:
+                    self._k8v4_mtp_steps = steps
             if use_lookup:
                 drafts, has_match = self.ngram.lookup(
                     self.req_states, input_batch.idx_mapping, num_sampled, last_sampled, input_batch.num_reqs
@@ -292,11 +324,19 @@ def _speculator_class():
                 *args, **kwargs,
             )
             self._pending = None
+            steps, self._k8v4_mtp_steps = self._k8v4_mtp_steps, None
             if not use_lookup:
                 return draft_tokens
             if not self._matched:
                 if input_batch.num_reqs == 1:
                     return draft_tokens
+                if steps is not None:
+                    # K8V4_DEEP_ALL=any: the MTP decode ran `steps` steps; later slots of unmatched
+                    # requests repeat their last MTP draft (rejectable filler, one-hot draft logits)
+                    draft_tokens[:, steps:] = draft_tokens[:, steps - 1 : steps]
+                    if self.draft_logits is not None:
+                        write_one_hot_draft_logits(self.draft_logits, input_batch.idx_mapping, ~has_match,
+                                                   draft_tokens, first_step=steps)
                 # K8V4_DEEP_ALL, some requests matched: their copies, MTP drafts for the rest
                 draft_tokens.copy_(torch.where(has_match[:, None], drafts, draft_tokens))
                 if self.draft_logits is not None:
