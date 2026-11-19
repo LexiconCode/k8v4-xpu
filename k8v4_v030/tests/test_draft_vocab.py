@@ -80,6 +80,24 @@ class DenseHeadTest(unittest.TestCase):
         self.assertTrue(set(top.tolist()) <= set(keep))
 
 
+@unittest.skipUnless(HAVE_TORCH, "torch is needed")
+class Int4FormTest(unittest.TestCase):
+    def test_forms(self):
+        import torch
+
+        head = SimpleNamespace()
+        self.assertEqual(draft_vocab.int4_form(head, torch.tensor([8], dtype=torch.int8)), "u4")
+        empty = torch.empty(0, dtype=torch.int8)
+        with self.assertRaises(RuntimeError):
+            draft_vocab.int4_form(head, empty)  # empty zero point without the s4 flip
+        head._k8v4_s4 = True
+        self.assertEqual(draft_vocab.int4_form(head, empty), "s4")
+        for bad in (None, torch.zeros(4, dtype=torch.int8)):
+            with self.subTest(bad=bad):
+                with self.assertRaises(RuntimeError):
+                    draft_vocab.int4_form(SimpleNamespace(), bad)
+
+
 def _xpu_ready() -> bool:
     if not (HAVE_TORCH and HAVE_VLLM):
         return False
@@ -125,6 +143,44 @@ class Int4HeadXpuTest(unittest.TestCase):
         self.assertTrue(torch.isinf(got[:, [i for i in range(vocab) if i not in set(keep)][:64]]).all())
         top = model.get_top_tokens(x)
         self.assertEqual(top.tolist(), got.argmax(dim=-1).tolist())
+
+
+_W4A8_LIB = os.environ.get("K8V4_W4A8_LIB", "/opt/k8v4/libk8v4_w4a8.so")
+
+
+@unittest.skipUnless(_xpu_ready() and os.path.isfile(_W4A8_LIB), "XPU and libk8v4_w4a8.so are needed")
+class S4HeadXpuTest(unittest.TestCase):
+    def test_s4_row_subset_matches_full_s4_head_columns(self):
+        import torch
+
+        torch.ops.load_library(_W4A8_LIB)
+        torch.manual_seed(1)
+        dev = torch.device("xpu")
+        vocab, hidden, group = 4096, 5120, 128
+        w_q = torch.randint(-2**31, 2**31 - 1, (vocab, hidden // 8), dtype=torch.int32).to(dev)
+        w_s = (torch.rand(hidden // group, vocab) * 0.02 + 0.001).to(torch.float16).to(dev)
+        w_zp = torch.empty(0, dtype=torch.int8, device=dev)
+        kernel = SimpleNamespace(config=SimpleNamespace(group_size=group),
+                                 _get_weight_params=lambda layer: (w_q, w_s, w_zp))
+        head = torch.nn.Module()
+        head.quant_method = SimpleNamespace(kernel=kernel)
+        head._k8v4_s4 = True
+        head.parameters = lambda: iter([torch.nn.Parameter(w_s, requires_grad=False)])
+        model = SimpleNamespace(
+            lm_head=head,
+            logits_processor=SimpleNamespace(org_vocab_size=vocab, soft_cap=None, scale=1.0, logits_as_input=False),
+        )
+        keep = sorted(torch.randperm(vocab)[:1024].tolist())
+        x = torch.randn(4, hidden, dtype=torch.bfloat16, device=dev)
+        full = torch.ops.k8v4_w4a8.int4_gemm_w4a16(x, w_q.t(), w_s, None, group)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertTrue(draft_vocab.install(model, {"K8V4_DRAFT_VOCAB": _write(tmp, keep)}))
+        got = model.compute_logits(x)
+        torch.xpu.synchronize()
+        gap = float((got[:, keep].float() - full[:, keep].float()).abs().max().item())
+        print("s4 subset head vs full s4 head on kept rows: max abs gap %.3g" % gap, flush=True)
+        self.assertEqual(gap, 0.0)
+        self.assertEqual(model.get_top_tokens(x).tolist(), got.argmax(dim=-1).tolist())
 
 
 class SpliceTest(unittest.TestCase):
