@@ -1089,7 +1089,7 @@ static void launch_int8k_int4v_s1_paged(sycl::queue &q, const std::int8_t *Q8, c
 //            row tile; the accumulator is rescaled by alpha per row before each page's mad.
 // The end writes acc / l, M = m, L = l, so the S2 merge math is unchanged (split = N pages).
 // TMAX bounds the live 8-row tiles (q_len * GQA <= 8 * TMAX); GRF selects the register file.
-template <int HKV, bool PF16, int TMAX, int GRF> class Xe2KvTorchAbiS1MultiKernel;
+template <int HKV, bool PF16, int TMAX, int GRF, bool FAST> class Xe2KvTorchAbiS1MultiKernel;
 
 static int s1_pages_per_program() {
   const char *v = std::getenv("XE2_KV_S1_PAGES");
@@ -1100,6 +1100,16 @@ static int s1_pages_per_program() {
 
 static constexpr int kMultiMaxRows = 48;
 
+// XE2_KV_S1_FAST=1 (multi-page S1 only): lazy-rescale online softmax in the log2 domain, no masks on
+// fully visible pages, padding rows skipped, one K load per k step for all row tiles of a sub-group.
+// Not bit-exact with the default multi-page kernel (fp16-level differences). Unset or 0: off.
+static bool s1_fast_enabled() {
+  const char *v = std::getenv("XE2_KV_S1_FAST");
+  if (v == nullptr || (v[0] == '0' && v[1] == '\0')) return false;
+  TORCH_CHECK(v[0] == '1' && v[1] == '\0', "XE2_KV_S1_FAST must be 0 or 1, got '", v, "'");
+  return true;
+}
+
 // Pages per S1 program, computed on device from the live length so S1 and S2 agree inside a
 // graph-static launch: fixed npg, or with splits > 0 the live pages divided evenly over that many
 // programs per KV head (no padded grid, every program gets ceil(live / splits) pages).
@@ -1109,7 +1119,7 @@ static inline int s1_pages_for(std::int64_t seq_len, int npg, int splits) {
   return static_cast<int>(sycl::max(static_cast<std::int64_t>(1), (live + splits - 1) / splits));
 }
 
-template <int HKV, bool PF16, int TMAX, int GRF>
+template <int HKV, bool PF16, int TMAX, int GRF, bool FAST>
 static void launch_int8k_int4v_s1_multi(sycl::queue &q, const std::int8_t *Q8, const float *Qsc,
                                         const std::int8_t *K8, const float *Ksc, const std::uint8_t *V4,
                                         const float *VS, const float *VZ, const std::int32_t *bt,
@@ -1126,7 +1136,8 @@ static void launch_int8k_int4v_s1_multi(sycl::queue &q, const std::int8_t *Q8, c
   sycl::range<1> g(static_cast<size_t>(nprog) * WG_SIZE);
   sycl::range<1> l(WG_SIZE);
   q.submit([&](sycl::handler &h) {
-    sycl::local_accessor<float, 1> slm(sycl::range<1>(kSlmFloats + 2 * BM), h);
+    // FAST adds 64 bytes: one "max moved" byte per (row tile, sub-group).
+    sycl::local_accessor<float, 1> slm(sycl::range<1>(kSlmFloats + 2 * BM + (FAST ? 16 : 0)), h);
     auto body = [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
       const int lid = static_cast<int>(item.get_local_id(0));
       const int prog = static_cast<int>(item.get_group(0));
@@ -1160,6 +1171,7 @@ static void launch_int8k_int4v_s1_multi(sycl::queue &q, const std::int8_t *Q8, c
       sycl::half *kv_tile = reinterpret_cast<sycl::half *>(s_i32);
       float *alpha_s = base_f + kSlmFloats;
       float *linv_s = alpha_s + BM;
+      std::uint8_t *moved_s = reinterpret_cast<std::uint8_t *>(linv_s + BM);  // FAST only
       auto s_slm_i = sycl::address_space_cast<sycl::access::address_space::local_space,
                                               sycl::access::decorated::no>(s_i32);
       auto p_slm = sycl::address_space_cast<sycl::access::address_space::local_space,
@@ -1190,6 +1202,41 @@ static void launch_int8k_int4v_s1_multi(sycl::queue &q, const std::int8_t *Q8, c
                                         : seq_len - static_cast<std::int64_t>(q_len) + q_tok + 1)
                         : 0;
       }
+      // FAST: scores in the log2 domain, int32 causal ends, and the smallest end over the query
+      // tokens (pages ending at or before it need no mask). Row sums stay per lane until the end.
+      constexpr float LOG2E = 1.4426950408889634f;
+      constexpr float LN2 = 0.6931471805599453f;
+      float qsl[TMAX], l_lane[TMAX];
+      int qend32[TMAX];
+      int min_qend = 0x7fffffff;
+      if constexpr (FAST) {
+#pragma unroll
+        for (int i = 0; i < TMAX; ++i) {
+          qsl[i] = qs_row[i] * (INV_SQRT_D * LOG2E);
+          qend32[i] = static_cast<int>(q_end[i]);
+          l_lane[i] = 0.f;
+        }
+        for (int qt = 0; qt < q_len; ++qt) {
+          const int e = visible_lens ? visible_lens[1 + qt] : static_cast<int>(seq_len) - q_len + qt + 1;
+          min_qend = e < min_qend ? e : min_qend;
+        }
+        // Padding rows of the last live tile: P stays 0 for the whole program.
+#pragma unroll
+        for (int i = 0; i < TMAX; ++i) {
+          const int r = sg_id + SG_COUNT * i;
+          if (i < T && r >= R) {
+#pragma unroll
+            for (int t = 0; t < NTN; ++t) p_slm[r * BN + t * SG_SIZE + lane] = sycl::half(0.f);
+          }
+        }
+      }
+      // FAST: did any row of tile t move its running max on this page?
+      auto tile_moved = [&](int t) {
+        std::uint32_t a, b;
+        std::memcpy(&a, moved_s + t * SG_COUNT, 4);
+        std::memcpy(&b, moved_s + t * SG_COUNT + 4, 4);
+        return (a | b) != 0;
+      };
 
       using AccT = jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, TM, TN>;
       AccT acc[TMAX][2];
@@ -1214,6 +1261,36 @@ static void launch_int8k_int4v_s1_multi(sycl::queue &q, const std::int8_t *Q8, c
                                             sycl::access::decorated::no>(
             const_cast<std::int8_t *>(K8 + k_head_off));
 
+        if constexpr (FAST) {
+          // Sub-group g owns 16-token tile g % 4 of row tiles g / 4, g / 4 + 2, ...: one K load per
+          // k step feeds every row tile of the sub-group (same jobs as below, K read once).
+          constexpr int TJ = (TMAX + 1) / 2;
+          const int nt = sg_id % NTN;
+          const int t0 = sg_id / NTN;
+          jm::joint_matrix<sycl::sub_group, std::int8_t, jm::use::a, TM, TK_I8, jm::layout::row_major> a;
+          jm::joint_matrix<sycl::sub_group, std::int8_t, jm::use::b, TK_I8, TN, jm::layout::col_major> b;
+          jm::joint_matrix<sycl::sub_group, std::int32_t, jm::use::accumulator, TM, TN> c[TJ];
+#pragma unroll
+          for (int u = 0; u < TJ; ++u) jm::joint_matrix_fill(sg, c[u], 0);
+          for (int k = 0; k < BK; k += TK_I8) {
+            jm::joint_matrix_load(sg, b, pK8 + (nt * TN) * k_tok_stride + k, k_tok_stride);
+#pragma unroll
+            for (int u = 0; u < TJ; ++u) {
+              const int t = t0 + 2 * u;
+              if (t < T) {
+                jm::joint_matrix_load(sg, a, pQ8 + (t * TM) * BK + k, BK);
+                jm::joint_matrix_mad(sg, c[u], a, b, c[u]);
+              }
+            }
+          }
+#pragma unroll
+          for (int u = 0; u < TJ; ++u) {
+            const int t = t0 + 2 * u;
+            if (t < T)
+              jm::joint_matrix_store(sg, c[u], s_slm_i + (t * TM) * BN + nt * TN, BN,
+                                     jm::layout::row_major);
+          }
+        } else
         // QK: job = (row tile, 16-token tile).
         for (int job = sg_id; job < T * NTN; job += SG_COUNT) {
           const int t = job / NTN;
@@ -1236,6 +1313,51 @@ static void launch_int8k_int4v_s1_multi(sycl::queue &q, const std::int8_t *Q8, c
 #pragma unroll
           for (int t = 0; t < NTN; ++t)
             ksc[t] = Ksc[sc_head_off + static_cast<size_t>(t * SG_SIZE + lane) * sc_tok_stride];
+          if constexpr (FAST) {
+            // Lazy rescale: the running max (log2 domain) moves only when a score exceeds it by more
+            // than 8, so P <= 2^8 still fits half and alpha is exactly 1 on almost every page; the
+            // max reduction runs only on pages that move it. Padding rows are skipped.
+            constexpr float TAU = 8.f;
+            const bool interior = n_valid == BM && logical * BM + BM <= min_qend;
+#pragma unroll
+            for (int i = 0; i < TMAX; ++i) {
+              const int r = sg_id + SG_COUNT * i;
+              if (i < T && r < R) {
+                float vals[NTN];
+                float lm = -INFINITY;
+#pragma unroll
+                for (int t = 0; t < NTN; ++t) {
+                  const int tok = t * SG_SIZE + lane;
+                  float sv = static_cast<float>(s_i32[r * BN + tok]) * (qsl[i] * ksc[t]);
+                  if (!interior && (tok >= n_valid || logical * BM + tok >= qend32[i])) sv = -INFINITY;
+                  vals[t] = sv;
+                  lm = sycl::max(lm, sv);
+                }
+                float alpha = 1.f;
+                if (sycl::any_of_group(sg, lm > m_run[i] + TAU)) {
+                  const float m_new = sycl::reduce_over_group(sg, lm, sycl::maximum<float>());
+                  alpha = sycl::exp2(m_run[i] - m_new);  // 0 when m_run is -inf
+                  m_run[i] = m_new;
+                }
+                float sum = 0.f;
+                float e[NTN];
+#pragma unroll
+                for (int t = 0; t < NTN; ++t) {
+                  e[t] = (m_run[i] == -INFINITY) ? 0.f : sycl::exp2(vals[t] - m_run[i]);
+                  sum += e[t];
+                }
+                l_lane[i] = l_lane[i] * alpha + sum;
+#pragma unroll
+                for (int t = 0; t < NTN; ++t) p_slm[r * BN + t * SG_SIZE + lane] = sycl::half(e[t]);
+                if (lane == 0) {
+                  alpha_s[r] = alpha;
+                  moved_s[i * SG_COUNT + sg_id] = alpha != 1.f ? 1 : 0;
+                }
+              } else if (i < T && lane == 0) {
+                moved_s[i * SG_COUNT + sg_id] = 0;
+              }
+            }
+          } else
 #pragma unroll
           for (int i = 0; i < TMAX; ++i) {
             const int r = sg_id + SG_COUNT * i;
@@ -1288,7 +1410,7 @@ static void launch_int8k_int4v_s1_multi(sycl::queue &q, const std::int8_t *Q8, c
           item.barrier(sycl::access::fence_space::local_space);
 #pragma unroll
           for (int t = 0; t < TMAX; ++t) {
-            if (t < T) {
+            if (t < T && (!FAST || tile_moved(t))) {
               const float *al = alpha_s + t * TM;
               sycl::ext::intel::experimental::matrix::joint_matrix_apply(
                   sg, acc[t][hv], [=](float &x, size_t row, size_t) { x *= al[row]; });
@@ -1311,6 +1433,13 @@ static void launch_int8k_int4v_s1_multi(sycl::queue &q, const std::int8_t *Q8, c
         }
       }
 
+      if constexpr (FAST) {
+#pragma unroll
+        for (int i = 0; i < TMAX; ++i) {
+          if (i < T) l_run[i] = sycl::reduce_over_group(sg, l_lane[i], sycl::plus<float>());
+          m_run[i] *= LN2;  // S2 merges natural-log maxima
+        }
+      }
 #pragma unroll
       for (int i = 0; i < TMAX; ++i) {
         const int r = sg_id + SG_COUNT * i;
@@ -1353,10 +1482,11 @@ static void launch_int8k_int4v_s1_multi(sycl::queue &q, const std::int8_t *Q8, c
     if constexpr (GRF == 256) {
       sycl::ext::oneapi::experimental::properties props{
           sycl::ext::intel::experimental::grf_size<256>};
-      h.parallel_for<Xe2KvTorchAbiS1MultiKernel<HKV, PF16, TMAX, GRF>>(sycl::nd_range<1>(g, l), props,
-                                                                       body);
+      h.parallel_for<Xe2KvTorchAbiS1MultiKernel<HKV, PF16, TMAX, GRF, FAST>>(sycl::nd_range<1>(g, l),
+                                                                             props, body);
     } else {
-      h.parallel_for<Xe2KvTorchAbiS1MultiKernel<HKV, PF16, TMAX, GRF>>(sycl::nd_range<1>(g, l), body);
+      h.parallel_for<Xe2KvTorchAbiS1MultiKernel<HKV, PF16, TMAX, GRF, FAST>>(sycl::nd_range<1>(g, l),
+                                                                             body);
     }
   });
 }
@@ -1376,18 +1506,25 @@ static void launch_s1_multi_dispatch(sycl::queue &q, const std::int8_t *Q8, cons
   // Large GRF by default: the register-resident accumulators spill in the 128-GRF mode.
   const char *gv = std::getenv("XE2_KV_S1_GRF");
   const bool big = !(gv != nullptr && std::atoi(gv) == 128);
-  auto go = [&](auto tmax, auto grf) {
-    launch_int8k_int4v_s1_multi<HKV, PF16, decltype(tmax)::value, decltype(grf)::value>(
+  const bool fast = s1_fast_enabled();
+  auto go = [&](auto tmax, auto grf, auto fst) {
+    launch_int8k_int4v_s1_multi<HKV, PF16, decltype(tmax)::value, decltype(grf)::value,
+                                decltype(fst)::value>(
         q, Q8, Qsc, K8, Ksc, V4, VS, VZ, bt, seq_lens, Part, M, L, n_groups, npg, q_len,
         k_page_stride, v_page_stride, sc_page_stride, visible_lens, pages_per_block, splits);
   };
-  auto pick = [&](auto grf) {
-    if (tiles <= 1) go(std::integral_constant<int, 1>{}, grf);
-    else if (tiles <= 3) go(std::integral_constant<int, 3>{}, grf);
-    else go(std::integral_constant<int, 6>{}, grf);
+  auto pick = [&](auto grf, auto fst) {
+    if (tiles <= 1) go(std::integral_constant<int, 1>{}, grf, fst);
+    else if (tiles <= 3) go(std::integral_constant<int, 3>{}, grf, fst);
+    else go(std::integral_constant<int, 6>{}, grf, fst);
   };
-  if (big) pick(std::integral_constant<int, 256>{});
-  else pick(std::integral_constant<int, 0>{});
+  if (fast) {
+    if (big) pick(std::integral_constant<int, 256>{}, std::true_type{});
+    else pick(std::integral_constant<int, 0>{}, std::true_type{});
+  } else {
+    if (big) pick(std::integral_constant<int, 256>{}, std::false_type{});
+    else pick(std::integral_constant<int, 0>{}, std::false_type{});
+  }
 }
 
 template <int HKV>
