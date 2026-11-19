@@ -15,7 +15,7 @@
 # bit-identity check, tools/gdn_exact_v030.py), as
 # build/libgdn_attn_kernels_xe_2.stock-rebuild.so.
 # K8V4_GDN_AOT overrides the AOT device list (default bmg-g31-a0: B70/B65).
-# K8V4_COMPILE_IMAGE: vLLM base + oneAPI 2026.0 at /opt/intel-2026/oneapi
+# K8V4_COMPILE_IMAGE: vLLM base + oneAPI 2026.x at /opt/intel-2026/oneapi
 # (default k8v4-compile-2026, Dockerfile.compile); it must match the image served.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -45,12 +45,11 @@ case "$have" in
 esac
 echo "vllm-xpu-kernels $have -> $XK_COMMIT"
 CMPLR_ROOT=""
-for c in /opt/intel-2026/oneapi/compiler/2026.0 /opt/intel-2026/oneapi/compiler/latest; do
+for c in /opt/intel-2026/oneapi/compiler/2026.1 /opt/intel-2026/oneapi/compiler/2026.0 /opt/intel-2026/oneapi/compiler/latest; do
   if [ -x "$c/bin/icpx" ]; then CMPLR_ROOT=$c; break; fi
 done
 test -n "$CMPLR_ROOT"
 export CMPLR_ROOT PATH="$CMPLR_ROOT/bin:$PATH"
-export LD_LIBRARY_PATH="$CMPLR_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export VLLM_XPU_AOT_DEVICES="$AOT" VLLM_XPU_XE2_AOT_DEVICES="$AOT"
 icpx --version | head -1
 git clone -q https://github.com/vllm-project/vllm-xpu-kernels.git /w/xk
