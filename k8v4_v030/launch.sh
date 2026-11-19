@@ -69,6 +69,13 @@ if [ -n "${K8V4_W4A8_FUSED:-}" ]; then
   w4a8_env+=(-e "K8V4_W4A8_FUSED=${K8V4_W4A8_FUSED}")
   CACHE_NAMESPACE="${CACHE_NAMESPACE}-fused-${K8V4_W4A8_FUSED//,/-}"
 fi
+# Optional [K, N]-contiguous dense weights for matching layers (k8v4_v030/ncontig.py). Unset changes
+# nothing; a set value is passed through and gets its own compile-cache namespace.
+ncontig_env=()
+if [ -n "${K8V4_NCONTIG_RE:-}" ]; then
+  ncontig_env+=(-e "K8V4_NCONTIG_RE=${K8V4_NCONTIG_RE}")
+  CACHE_NAMESPACE="${CACHE_NAMESPACE}-ncontig"
+fi
 DRY_RUN=${K8V4_DRY_RUN:-0}
 [[ "$DRY_RUN" =~ ^[01]$ && "$PREFIX_CACHING" =~ ^[01]$ ]] || {
   echo "K8V4_DRY_RUN and K8V4_PREFIX_CACHING must be 0 or 1" >&2; exit 2;
@@ -222,6 +229,7 @@ docker_cmd=(docker run -d --name "$NAME" --restart=no \
   -v "${HERE}:/opt/k8v4/k8v4_v030:ro" \
   "${extra[@]}" \
   "${w4a8_env[@]}" \
+  "${ncontig_env[@]}" \
   -e PYTHONPATH=/opt/k8v4 \
   -e XE2_KV_LIB=/opt/k8v4/libxe2_kv.so \
   -e K8V4_SDPA_LIB=/opt/k8v4/libk8v4_sdpa.so \
