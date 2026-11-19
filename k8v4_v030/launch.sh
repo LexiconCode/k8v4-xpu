@@ -100,8 +100,8 @@ else
 fi
 # Optional GDN recurrent-state dtype (docs/2026-11-19-decode-push.md). Unset keeps vLLM's choice, which for
 # Qwen3.5-family checkpoints is the config's mamba_ssm_dtype (float32 in the Swift bake). float16 halves the
-# state bytes every decode step reads and writes (4.8 -> ~2.6 ms of GDN per 4 x 63K step on one B70) and
-# changes numerics. Off unless set.
+# GDN state memory (KV 384K -> 445K tokens at util 0.96, 4 seqs, one B70) and changes numerics; the stock spec
+# kernel is not faster with it (16-bit state stores), K8V4_GDN_RECOVERSSM is. Off unless set.
 mamba=()
 if [ -n "${K8V4_MAMBA_SSM_DTYPE:-}" ]; then
   [[ "$K8V4_MAMBA_SSM_DTYPE" =~ ^(float32|float16|bfloat16)$ ]] || {
