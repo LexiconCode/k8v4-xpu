@@ -394,6 +394,89 @@ def _runtime_mlp_fake(x, packed, scales, zeros, group_size, bias):
     return x.new_empty((x.numel() // x.shape[-1], packed.shape[1]))
 
 
+# K8V4_W4A8_FUSED=silu (with K8V4_W4A8_KERNEL=onednn and K8V4_W4A8_AGROUP):
+# an MLP's down projection takes gate_up_proj's output and does
+# SiLU(gate) * up inside its grouped int8 quantizer, so the
+# [tokens, intermediate] product is never written out and read back. The
+# product is rounded to the activation dtype before quantizing, as the
+# unfused SiLU-and-mul output is. Rows at or below SMALL_M_MAX take vLLM's
+# silu_and_mul op and the library w4a16 GEMM.
+FUSIONS = ("silu",)
+_FUSED = frozenset()
+_SILU_COMPILED = None
+
+
+def parse_fused(raw: str | None, kernel: str, agroup: int) -> frozenset:
+    if raw is None or raw.strip() == "":
+        return frozenset()
+    names = [name.strip().lower() for name in raw.split(",")]
+    if any(name not in FUSIONS for name in names):
+        raise RuntimeError("K8V4_W4A8_FUSED must be a comma list of %s, got %s"
+                           % (",".join(FUSIONS), raw))
+    if kernel != "onednn" or not agroup:
+        raise RuntimeError("K8V4_W4A8_FUSED needs K8V4_W4A8_KERNEL=onednn and K8V4_W4A8_AGROUP")
+    return frozenset(names)
+
+
+def _silu_quantize_grouped(gate_up: torch.Tensor, group: int):
+    """``SiLU(gate) * up`` rounded to the input dtype, then ``_quantize_grouped``."""
+    width = gate_up.shape[-1] // 2
+    gate = gate_up[:, :width].to(torch.float32)
+    up = gate_up[:, width:].to(torch.float32)
+    product = (gate * torch.sigmoid(gate) * up).to(gate_up.dtype)
+    return _quantize_grouped(product, group)
+
+
+def _silu_and_mul(gate_up: torch.Tensor) -> torch.Tensor:
+    out = gate_up.new_empty((gate_up.shape[0], gate_up.shape[1] // 2))
+    torch.ops._C.silu_and_mul(out, gate_up)
+    return out
+
+
+def _silu_body(gate_up, packed, scales, zeros, group_size):
+    flat = gate_up.reshape(-1, gate_up.shape[-1])
+    if not (_RUNTIME_ENABLED and _AGROUP and flat.shape[0] > SMALL_M_MAX):
+        return _runtime_mlp_body(_silu_and_mul(flat), packed, scales, zeros, group_size, None)
+    global _SILU_COMPILED
+    if _SILU_COMPILED is None:
+        _SILU_COMPILED = torch.compile(_silu_quantize_grouped, dynamic=True, fullgraph=True)
+    quant_x, x_scale = _SILU_COMPILED(flat, _AGROUP)
+    out = _lib().int4_gemm_w4a8(quant_x, x_scale, None, packed, scales, None, group_size, None,
+                                flat.dtype == torch.bfloat16)
+    return out if out.dtype == flat.dtype else out.to(dtype=flat.dtype)
+
+
+@torch.library.custom_op("k8v4_prefill::silu_gemm", mutates_args=())
+def runtime_silu_gemm(gate_up: torch.Tensor, packed: torch.Tensor, scales: torch.Tensor,
+                      zeros: torch.Tensor, group_size: int) -> torch.Tensor:
+    return _silu_body(gate_up, packed, scales, zeros, group_size)
+
+
+@runtime_silu_gemm.register_fake
+def _runtime_silu_fake(gate_up, packed, scales, zeros, group_size):
+    return gate_up.new_empty((gate_up.numel() // gate_up.shape[-1], packed.shape[1]))
+
+
+def _install_silu_mlp(cls) -> None:
+    """Route a marked MLP (down_proj._k8v4_silu_kernel) through the fused op."""
+    current = cls.forward
+    if getattr(current, "_k8v4_silu", False):
+        return
+
+    def forward(self, x, *args, **kwargs):
+        down = self.down_proj
+        kernel = getattr(down, "_k8v4_silu_kernel", None)
+        if kernel is None or args or kwargs or getattr(self, "expert_gate", None) is not None:
+            return current(self, x, *args, **kwargs)
+        gate_up, _ = self.gate_up_proj(x)
+        packed, scales, zeros = _compile_safe_views(kernel, down)
+        return runtime_silu_gemm(gate_up, packed, scales, zeros, int(kernel.config.group_size))
+
+    forward._k8v4_silu = True
+    forward._k8v4_orig = current
+    cls.forward = forward
+
+
 def _install_on_class(cls) -> None:
     global _ORIG_APPLY
     current = cls.apply_weights
@@ -442,6 +525,10 @@ def _install_s4_loader(cls) -> None:
         setattr(layer, self.w_zp_name, torch.nn.Parameter(
             qweight.data.new_empty(0, dtype=torch.int8), requires_grad=False))
         layer._k8v4_s4 = True
+        prefix = getattr(layer, "prefix", "") or ""
+        if ("silu" in _FUSED and _AGROUP and prefix.endswith(".mlp.down_proj")
+                and getattr(layer, "tp_size", 1) == 1):
+            layer._k8v4_silu_kernel = self
 
     process_weights_after_loading._k8v4_s4 = True
     cls.process_weights_after_loading = process_weights_after_loading
@@ -541,13 +628,14 @@ def remove_import_hook(finder=None) -> None:
 
 def install_if_requested() -> None:
     """Install before model compilation; cached opaque calls honor opt-out too."""
-    global _RUNTIME_ENABLED, _LAYERS, _KERNEL, _AGROUP
+    global _RUNTIME_ENABLED, _LAYERS, _KERNEL, _AGROUP, _FUSED
     mode = os.environ.get("K8V4_PREFILL_GEMM", "w4a16")
     if mode not in ("w4a16", "w4a8"):
         raise RuntimeError("K8V4_PREFILL_GEMM must be w4a16 or w4a8")
     _LAYERS = parse_layer_families(os.environ.get("K8V4_W4A8_LAYERS"))
     kernel = parse_kernel(os.environ.get("K8V4_W4A8_KERNEL"))
     _AGROUP = parse_agroup(os.environ.get("K8V4_W4A8_AGROUP"), kernel)
+    _FUSED = parse_fused(os.environ.get("K8V4_W4A8_FUSED"), kernel, _AGROUP)
     _RUNTIME_ENABLED = mode == "w4a8"
     _KERNEL = kernel if _RUNTIME_ENABLED else "xpu"
     if _RUNTIME_ENABLED:
@@ -561,6 +649,11 @@ def install_if_requested() -> None:
                              % (path, torch.ops.k8v4_w4a8.onednn_version(),
                                 _AGROUP or "per token"))
         install()
+        if "silu" in _FUSED:
+            from vllm.model_executor.models import qwen2_moe
+
+            _install_silu_mlp(qwen2_moe.Qwen2MoeMLP)
+            sys.stderr.write("k8v4_w4a8: SiLU-and-mul fused into the down projections' quantizer\n")
         if _LAYERS == frozenset(("mlp",)):
             sys.stderr.write("k8v4_w4a8: MLP-only installer active; small-M runtime gate=128\n")
         else:
