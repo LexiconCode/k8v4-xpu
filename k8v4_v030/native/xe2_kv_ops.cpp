@@ -1441,6 +1441,18 @@ static void launch_int8k_int4v_s1_multi(sycl::queue &q, const std::int8_t *Q8, c
 
         jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, TM, TK, jm::layout::row_major> a;
         jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, TK, TN, jm::layout::row_major> b;
+        // PREG (FAST, up to 3 row tiles): P fragments loaded once per page, reused by both V halves.
+        constexpr bool PREG = FAST && TMAX <= 3;
+        jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, TM, TK, jm::layout::row_major>
+            pa[PREG ? TMAX : 1][PREG ? NTN : 1];
+        if constexpr (PREG) {
+#pragma unroll
+          for (int t = 0; t < TMAX; ++t)
+            if (t < T)
+#pragma unroll
+              for (int kc = 0; kc < NTN; ++kc)
+                jm::joint_matrix_load(sg, pa[t][kc], p_slm + (t * NTN + kc) * (TM * TK), TK);
+        }
 #pragma unroll
         for (int hv = 0; hv < 2; ++hv) {
           if constexpr (FAST)
@@ -1468,11 +1480,16 @@ static void launch_int8k_int4v_s1_multi(sycl::queue &q, const std::int8_t *Q8, c
 #pragma unroll
             for (int t = 0; t < TMAX; ++t) {
               if (t < T) {
-                if constexpr (FAST)
-                  jm::joint_matrix_load(sg, a, p_slm + (t * NTN + (k0 >> 4)) * (TM * TK), TK);
-                else
-                  jm::joint_matrix_load(sg, a, p_slm + (t * TM) * BN + k0, BN);
-                jm::joint_matrix_mad(sg, acc[t][hv], a, b, acc[t][hv]);
+                if constexpr (PREG) {
+                  jm::joint_matrix_mad(sg, acc[t][hv], pa[PREG ? t : 0][PREG ? (k0 >> 4) : 0], b,
+                                       acc[t][hv]);
+                } else {
+                  if constexpr (FAST)
+                    jm::joint_matrix_load(sg, a, p_slm + (t * NTN + (k0 >> 4)) * (TM * TK), TK);
+                  else
+                    jm::joint_matrix_load(sg, a, p_slm + (t * TM) * BN + k0, BN);
+                  jm::joint_matrix_mad(sg, acc[t][hv], a, b, acc[t][hv]);
+                }
               }
             }
           }
