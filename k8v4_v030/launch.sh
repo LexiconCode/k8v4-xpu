@@ -68,6 +68,22 @@ for ((i=1; i<=MAX_SEQS; i++)); do
   CAPTURE_SIZES+=$((i * 7))
 done
 CAPTURE_SIZES+="]"
+SPEC_CONFIG='{"method":"mtp","num_speculative_tokens":6}'
+# Deep copy drafting (k8v4_v030/deep_draft.py, vLLM 0.34): K8V4_DEEP_DRAFT=lo,hi n-gram lengths.
+# A lone copying request drafts K8V4_DEEP_DEPTH (default 15) copied tokens, verified in decode-tile
+# chunks (K8V4_VERIFY_CHUNK, default 8); otherwise it keeps MTP depth 6, and 2+ requests draft 3.
+# Off unless set; the default speculative config and capture list are unchanged.
+if [ -n "${K8V4_DEEP_DRAFT:-}" ]; then
+  [[ "$K8V4_DEEP_DRAFT" =~ ^[0-9]+(,[0-9]+)?$ ]] || { echo "K8V4_DEEP_DRAFT must be lo,hi" >&2; exit 2; }
+  DEEP_DEPTH=${K8V4_DEEP_DEPTH:-15}
+  [[ "$DEEP_DEPTH" =~ ^[0-9]+$ ]] && [ "$DEEP_DEPTH" -ge 7 ] && [ "$DEEP_DEPTH" -le 31 ] || { echo "K8V4_DEEP_DEPTH must be 7..31" >&2; exit 2; }
+  SCHEDULE="[1,1,$DEEP_DEPTH]"
+  if [ "$MAX_SEQS" -gt 1 ]; then SCHEDULE+=",[2,$MAX_SEQS,3]"; fi
+  SPEC_CONFIG="{\"method\":\"mtp\",\"num_speculative_tokens\":$DEEP_DEPTH,\"num_speculative_tokens_per_batch_size\":[$SCHEDULE]}"
+  sizes=(7 $((DEEP_DEPTH + 1)))
+  for ((i=2; i<=MAX_SEQS; i++)); do sizes+=($((i * 4))); done
+  CAPTURE_SIZES="[$(printf '%s\n' "${sizes[@]}" | sort -nu | paste -sd, -)]"
+fi
 
 if [ -z "$MODEL_DIR" ] || [ ! -d "$MODEL_DIR" ]; then
   echo "Set MODEL_DIR to the local weights directory." >&2
@@ -158,6 +174,12 @@ if [ -n "${K8V4_VERIFY_CHUNK:-}" ]; then
   extra+=(-e "K8V4_VERIFY_CHUNK=${K8V4_VERIFY_CHUNK}")
 fi
 
+if [ -n "${K8V4_DEEP_DRAFT:-}" ]; then
+  extra+=(-e "K8V4_DEEP_DRAFT=${K8V4_DEEP_DRAFT}")
+  if [ -z "${K8V4_VERIFY_CHUNK:-}" ]; then extra+=(-e K8V4_VERIFY_CHUNK=8); fi
+  if [ -n "${K8V4_DEEP_MTP_DEPTH:-}" ]; then extra+=(-e "K8V4_DEEP_MTP_DEPTH=${K8V4_DEEP_MTP_DEPTH}"); fi
+fi
+
 docker_cmd=(docker run -d --name "$NAME" --restart=no \
   --device /dev/dri --group-add "$render_gid" --ipc=host --shm-size=8g \
   -p "${BIND_HOST}:${PORT}:8000" \
@@ -207,7 +229,7 @@ docker_cmd=(docker run -d --name "$NAME" --restart=no \
   "${prefix[@]}" \
   "${multimodal[@]}" \
   --trust-remote-code \
-  --speculative-config='{"method":"mtp","num_speculative_tokens":6}' \
+  --speculative-config="$SPEC_CONFIG" \
   --compilation-config="{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":$CAPTURE_SIZES}")
 
 if [ "$DRY_RUN" = 1 ]; then
