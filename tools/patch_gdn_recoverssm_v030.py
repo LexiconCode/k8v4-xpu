@@ -5,7 +5,8 @@ unknown source. Every spliced hook is inert unless K8V4_GDN_RECOVERSSM=1 and vLL
 
 - config/vllm.py validate_mamba_cached_kernel: the GDN models join the RecoverSSM model list (knob on only).
 - model_executor/models/qwen3_5.py: Qwen3_5ForCausalLM / Qwen3_5ForConditionalGeneration declare
-  supports_replayssm (vLLM consults it only under --use-replayssm); models/qwen3_5/__init__.py gets a comment
+  supports_replayssm (vLLM consults it only under --use-replayssm), and so does the MTP draft model
+  (model_executor/models/qwen3_5_mtp.py); models/qwen3_5/__init__.py gets a comment
   so the model-info cache key (it hashes that package, not the legacy module) moves with it.
 - model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py: QwenGatedDeltaNetAttention gets the replay buffer
   and the RecoverSSM metadata backend when the layer runs RecoverSSM.
@@ -56,6 +57,13 @@ _COND_OLD = (
 )
 _COND_NEW = _COND_OLD + (
     "    # %s: the GDN layers can run RecoverSSM (consulted only under --use-replayssm)\n"
+    "    supports_replayssm = True\n"
+) % MARK
+
+MTP = "model_executor/models/qwen3_5_mtp.py"
+_MTP_OLD = "class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):\n"
+_MTP_NEW = _MTP_OLD + (
+    "    # %s: the draft config passes the same RecoverSSM model check as the target\n"
     "    supports_replayssm = True\n"
 ) % MARK
 
@@ -137,6 +145,7 @@ SPLICES = (
     (CONFIG, _CONFIG_OLD, _CONFIG_NEW, "rssm_config"),
     (MODEL, _CAUSAL_OLD, _CAUSAL_NEW, "rssm_causal"),
     (MODEL, _COND_OLD, _COND_NEW, "rssm_cond"),
+    (MTP, _MTP_OLD, _MTP_NEW, "rssm_mtp"),
     (PKG, _PKG_OLD, _PKG_NEW, "rssm_pkg"),
     (LAYER, _LAYER_OLD, _LAYER_NEW, "rssm_layer"),
     (OPS, _OPS_OLD, _OPS_NEW, "rssm_ops"),
