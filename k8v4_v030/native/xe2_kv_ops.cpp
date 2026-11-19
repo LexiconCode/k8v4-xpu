@@ -159,6 +159,38 @@ static inline void decode_v_int4_vec_strided(int lid, const std::uint8_t *v4_hea
   }
 }
 
+// decode_v_int4_vec_strided into a blocked tile (FAST multi-page S1): element (tok, c) of the 128
+// columns starting at nbase lands in 16x16 block (tok / 16) * 8 + c / 16, row tok % 16, column c % 16,
+// so each PV operand load reads one contiguous 512-byte block. Same arithmetic.
+static inline void decode_v_int4_blk(int lid, const std::uint8_t *v4_head, int v_tok_stride,
+                                     const float *vs_head, const float *vz_head, int sc_stride,
+                                     int nbase, int n_valid, sycl::half *tile) {
+  const int tok = lid >> 1;
+  const int part = lid & 1;
+  sycl::half *row = tile + ((tok >> 4) * 8 + part * 4) * 256 + (tok & 15) * 16;
+  if (tok >= n_valid) {
+#pragma unroll
+    for (int e = 0; e < 64; ++e) row[(e >> 4) * 256 + (e & 15)] = sycl::half(0.f);
+    return;
+  }
+  const float scale = vs_head[tok * sc_stride];
+  const float zero = vz_head[tok * sc_stride];
+  const std::uint8_t *src = v4_head + static_cast<size_t>(tok) * v_tok_stride + (nbase >> 1) + part * 32;
+#pragma unroll
+  for (int e = 0; e < 32; e += 8) {
+    std::uint64_t raw;
+    std::memcpy(&raw, src + e, sizeof(raw));
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const std::uint8_t b = static_cast<std::uint8_t>(raw >> (8 * j));
+      const int c = 2 * (e + j);
+      row[(c >> 4) * 256 + (c & 15)] = sycl::half((static_cast<float>(b & 0xFu) - zero) * scale);
+      row[((c + 1) >> 4) * 256 + ((c + 1) & 15)] =
+          sycl::half((static_cast<float>(b >> 4) - zero) * scale);
+    }
+  }
+}
+
 template <int HKV> class Xe2KvTorchAbiQquantKernel;
 template <int HKV> class Xe2KvTorchAbiPackQquantKernel;
 class Xe2KvTorchAbiKstoreKernel;
@@ -1101,7 +1133,8 @@ static int s1_pages_per_program() {
 static constexpr int kMultiMaxRows = 48;
 
 // XE2_KV_S1_FAST=1 (multi-page S1 only): lazy-rescale online softmax in the log2 domain, no masks on
-// fully visible pages, padding rows skipped, one K load per k step for all row tiles of a sub-group.
+// fully visible pages, padding rows skipped, one K load per k step for all row tiles of a sub-group,
+// and P / V tiles stored as contiguous blocks for the PV operand loads.
 // Not bit-exact with the default multi-page kernel (fp16-level differences). Unset or 0: off.
 static bool s1_fast_enabled() {
   const char *v = std::getenv("XE2_KV_S1_FAST");
@@ -1202,6 +1235,11 @@ static void launch_int8k_int4v_s1_multi(sycl::queue &q, const std::int8_t *Q8, c
                                         : seq_len - static_cast<std::int64_t>(q_len) + q_tok + 1)
                         : 0;
       }
+      // P element (row, token): row-major [64][64], or contiguous 8x16 blocks for FAST.
+      auto pix = [&](int r, int tok) {
+        if constexpr (FAST) return ((r >> 3) * NTN + (tok >> 4)) * (TM * TK) + (r & 7) * TK + (tok & 15);
+        else return r * BN + tok;
+      };
       // FAST: scores in the log2 domain, int32 causal ends, and the smallest end over the query
       // tokens (pages ending at or before it need no mask). Row sums stay per lane until the end.
       constexpr float LOG2E = 1.4426950408889634f;
@@ -1226,7 +1264,7 @@ static void launch_int8k_int4v_s1_multi(sycl::queue &q, const std::int8_t *Q8, c
           const int r = sg_id + SG_COUNT * i;
           if (i < T && r >= R) {
 #pragma unroll
-            for (int t = 0; t < NTN; ++t) p_slm[r * BN + t * SG_SIZE + lane] = sycl::half(0.f);
+            for (int t = 0; t < NTN; ++t) p_slm[pix(r, t * SG_SIZE + lane)] = sycl::half(0.f);
           }
         }
       }
@@ -1348,7 +1386,7 @@ static void launch_int8k_int4v_s1_multi(sycl::queue &q, const std::int8_t *Q8, c
                 }
                 l_lane[i] = l_lane[i] * alpha + sum;
 #pragma unroll
-                for (int t = 0; t < NTN; ++t) p_slm[r * BN + t * SG_SIZE + lane] = sycl::half(e[t]);
+                for (int t = 0; t < NTN; ++t) p_slm[pix(r, t * SG_SIZE + lane)] = sycl::half(e[t]);
                 if (lane == 0) {
                   alpha_s[r] = alpha;
                   moved_s[i * SG_COUNT + sg_id] = alpha != 1.f ? 1 : 0;
@@ -1405,8 +1443,12 @@ static void launch_int8k_int4v_s1_multi(sycl::queue &q, const std::int8_t *Q8, c
         jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, TK, TN, jm::layout::row_major> b;
 #pragma unroll
         for (int hv = 0; hv < 2; ++hv) {
-          decode_v_int4_vec_strided(lid, V4 + v_head_off, v_tok_stride, VS + sc_head_off,
-                                    VZ + sc_head_off, sc_tok_stride, hv * KV_HALF, n_valid, kv_tile);
+          if constexpr (FAST)
+            decode_v_int4_blk(lid, V4 + v_head_off, v_tok_stride, VS + sc_head_off, VZ + sc_head_off,
+                              sc_tok_stride, hv * KV_HALF, n_valid, kv_tile);
+          else
+            decode_v_int4_vec_strided(lid, V4 + v_head_off, v_tok_stride, VS + sc_head_off,
+                                      VZ + sc_head_off, sc_tok_stride, hv * KV_HALF, n_valid, kv_tile);
           item.barrier(sycl::access::fence_space::local_space);
 #pragma unroll
           for (int t = 0; t < TMAX; ++t) {
@@ -1419,11 +1461,17 @@ static void launch_int8k_int4v_s1_multi(sycl::queue &q, const std::int8_t *Q8, c
           // One V slab load per k step, reused by every live row tile.
 #pragma unroll
           for (int k0 = 0; k0 < BN; k0 += TK) {
-            jm::joint_matrix_load(sg, b, pKV + k0 * KV_HALF + sg_id * TN, KV_HALF);
+            if constexpr (FAST)
+              jm::joint_matrix_load(sg, b, pKV + ((k0 >> 4) * 8 + sg_id) * 256, TN);
+            else
+              jm::joint_matrix_load(sg, b, pKV + k0 * KV_HALF + sg_id * TN, KV_HALF);
 #pragma unroll
             for (int t = 0; t < TMAX; ++t) {
               if (t < T) {
-                jm::joint_matrix_load(sg, a, p_slm + (t * TM) * BN + k0, BN);
+                if constexpr (FAST)
+                  jm::joint_matrix_load(sg, a, p_slm + (t * NTN + (k0 >> 4)) * (TM * TK), TK);
+                else
+                  jm::joint_matrix_load(sg, a, p_slm + (t * TM) * BN + k0, BN);
                 jm::joint_matrix_mad(sg, acc[t][hv], a, b, acc[t][hv]);
               }
             }
