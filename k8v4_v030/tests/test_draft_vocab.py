@@ -80,6 +80,53 @@ class DenseHeadTest(unittest.TestCase):
         self.assertTrue(set(top.tolist()) <= set(keep))
 
 
+def _xpu_ready() -> bool:
+    if not (HAVE_TORCH and HAVE_VLLM):
+        return False
+    import torch
+
+    xpu = getattr(torch, "xpu", None)
+    return bool(xpu is not None and xpu.is_available())
+
+
+@unittest.skipUnless(_xpu_ready(), "XPU and vLLM are needed")
+class Int4HeadXpuTest(unittest.TestCase):
+    def test_gptq_row_subset_matches_full_head_columns(self):
+        import torch
+
+        import vllm._xpu_ops  # noqa: F401  (registers torch.ops._xpu_C)
+
+        torch.manual_seed(0)
+        dev = torch.device("xpu")
+        vocab, hidden, group = 4096, 5120, 128
+        w_q = torch.randint(-2**31, 2**31 - 1, (vocab, hidden // 8), dtype=torch.int32).to(dev)
+        w_s = (torch.rand(hidden // group, vocab) * 0.02 + 0.001).to(torch.float16).to(dev)
+        w_zp = torch.tensor([8], dtype=torch.int8, device=dev)
+        kernel = SimpleNamespace(config=SimpleNamespace(group_size=group),
+                                 _get_weight_params=lambda layer: (w_q, w_s, w_zp))
+        head = torch.nn.Module()
+        head.register_buffer("w", w_q)
+        head.quant_method = SimpleNamespace(kernel=kernel)
+        model = SimpleNamespace(
+            lm_head=head,
+            logits_processor=SimpleNamespace(org_vocab_size=vocab, soft_cap=None, scale=1.0, logits_as_input=False),
+        )
+        head.parameters = lambda: iter([torch.nn.Parameter(w_s, requires_grad=False)])
+        keep = sorted(torch.randperm(vocab)[:1024].tolist())
+        x = torch.randn(4, hidden, dtype=torch.bfloat16, device=dev)
+        full = torch.ops._xpu_C.int4_gemm_w4a16(x, w_q.t(), None, w_s, w_zp, group, None)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertTrue(draft_vocab.install(model, {"K8V4_DRAFT_VOCAB": _write(tmp, keep)}))
+        got = model.compute_logits(x)
+        torch.xpu.synchronize()
+        gap = float((got[:, keep].float() - full[:, keep].float()).abs().max().item())
+        print("int4 subset head vs full head on kept rows: max abs gap %.3g" % gap, flush=True)
+        self.assertLess(gap, 1e-2 * float(full.abs().max().item()) + 1e-3)
+        self.assertTrue(torch.isinf(got[:, [i for i in range(vocab) if i not in set(keep)][:64]]).all())
+        top = model.get_top_tokens(x)
+        self.assertEqual(top.tolist(), got.argmax(dim=-1).tolist())
+
+
 class SpliceTest(unittest.TestCase):
     def test_splice_applies_once_and_refuses_unknown_source(self):
         with tempfile.TemporaryDirectory() as tmp:
