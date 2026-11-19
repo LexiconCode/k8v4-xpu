@@ -178,12 +178,9 @@ def _speculator_class():
         return _CLASS
     import torch
 
-    from vllm.logger import init_logger
     from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 
     from k8v4_v030.ngram_lookup import NgramLookup, write_one_hot_draft_logits
-
-    logger = init_logger(__name__)
 
     class NgramMTPSpeculator(MTPSpeculator):
         """MTP drafting that copies from the context on an n-gram match (one request)."""
@@ -198,9 +195,10 @@ def _speculator_class():
             self._pending = None
             self._matched = False
             self.ngram_stats = [0, 0]  # [lookups, full-length matches]
-            logger.info(
-                "K8V4 deep drafting: n-gram %d..%d, depth %d on a copy, MTP depth %d otherwise",
-                min_n, max_n, self.num_speculative_steps, depth,
+            print(
+                "k8v4 deep drafting: n-gram %d..%d, depth %d on a copy, MTP depth %d otherwise"
+                % (min_n, max_n, self.num_speculative_steps, depth),
+                flush=True,
             )
 
         def k8v4_num_draft_steps(self, num_speculative_tokens: int) -> int:
