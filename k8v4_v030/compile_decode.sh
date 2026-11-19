@@ -24,7 +24,7 @@ export LD_LIBRARY_PATH="${LIBDIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 "$ICPX" --version
 TORCH=/opt/venv/lib/python3.12/site-packages/torch
 PY=/usr/include/python3.12
-nice -n 19 "$ICPX" -O2 -fsycl -fPIC -shared -std=c++17 -D_GLIBCXX_USE_CXX11_ABI=1 \
+nice -n 19 "$ICPX" -O2 -fsycl -fPIC -shared -std=c++20 -D_GLIBCXX_USE_CXX11_ABI=1 \
   -Wno-deprecated-declarations \
   -I"$TORCH/include" -I"$TORCH/include/torch/csrc/api/include" -I"$PY" \
   /src/xe2_kv_ops.cpp -o /out/libxe2_kv.so \

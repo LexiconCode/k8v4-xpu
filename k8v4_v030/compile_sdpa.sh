@@ -33,7 +33,7 @@ done
 test -n "$DNNL_LIB"
 echo "DNNL_INC $DNNL_INC"
 echo "DNNL_LIB $DNNL_LIB"
-nice -n 19 "$ICPX" -O2 -fsycl -fPIC -shared -std=c++17 -D_GLIBCXX_USE_CXX11_ABI=1 \
+nice -n 19 "$ICPX" -O2 -fsycl -fPIC -shared -std=c++20 -D_GLIBCXX_USE_CXX11_ABI=1 \
   -Wno-deprecated-declarations \
   -I"$TORCH/include" -I"$TORCH/include/torch/csrc/api/include" -I"$PY" -I"$DNNL_INC" \
   /src/k8v4_sdpa.cpp -o /out/libk8v4_sdpa.so \
