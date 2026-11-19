@@ -130,7 +130,7 @@ if [ -n "$SHARED_DEPTH" ]; then
     done
     CAPTURE_SIZES="[$(printf '%s\n' "${sizes[@]}" | sort -nu | paste -sd, -)]"
   fi
-SPEC_CONFIG='{"method":"mtp","num_speculative_tokens":6}'
+fi
 # Deep copy drafting (k8v4_v030/deep_draft.py, vLLM 0.34): K8V4_DEEP_DRAFT=lo,hi n-gram lengths.
 # A lone copying request drafts K8V4_DEEP_DEPTH (default 15) copied tokens, verified in decode-tile
 # chunks (K8V4_VERIFY_CHUNK, default 8); otherwise it keeps MTP depth 6, and 2+ requests draft 3.
