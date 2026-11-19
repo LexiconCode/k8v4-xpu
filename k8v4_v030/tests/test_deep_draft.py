@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -152,8 +154,12 @@ class ImportTest(unittest.TestCase):
     def test_speculator_class_builds_on_this_vllm(self):
         if importlib.util.find_spec("vllm.v1.worker.gpu.spec_decode.target_dependent_ar") is None:
             self.skipTest("vLLM without target_dependent_ar (0.30)")
-        cls = deep_draft._speculator_class()
-        self.assertTrue(hasattr(cls, "k8v4_num_draft_steps"))
+        # A child process: importing the speculators loads vLLM kernel modules that other
+        # tests (the W4A8 import hook) expect to load later.
+        code = ("from k8v4_v030 import deep_draft; "
+                "assert hasattr(deep_draft._speculator_class(), 'k8v4_num_draft_steps')")
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
 
 
 if __name__ == "__main__":
