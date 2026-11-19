@@ -30,6 +30,16 @@ case "$TP" in
     ;;
   *) echo "K8V4_TP must be 1 or 2" >&2; exit 2 ;;
 esac
+# Optional wider W4A8 prefill gate (see k8v4_v030/w4a8_prefill.py). Unset keeps MLP-only and the
+# command unchanged; a set value is passed through and gets its own compile-cache namespace.
+w4a8_env=()
+if [ -n "${K8V4_W4A8_LAYERS:-}" ]; then
+  [[ "$K8V4_W4A8_LAYERS" =~ ^(all|(mlp|attn|gdn|other)(,(mlp|attn|gdn|other))*)$ ]] || {
+    echo "K8V4_W4A8_LAYERS must be all or a comma list of mlp,attn,gdn,other" >&2; exit 2;
+  }
+  w4a8_env+=(-e "K8V4_W4A8_LAYERS=${K8V4_W4A8_LAYERS}")
+  CACHE_NAMESPACE="${CACHE_NAMESPACE}-layers-${K8V4_W4A8_LAYERS//,/-}"
+fi
 DRY_RUN=${K8V4_DRY_RUN:-0}
 [[ "$DRY_RUN" =~ ^[01]$ && "$PREFIX_CACHING" =~ ^[01]$ ]] || {
   echo "K8V4_DRY_RUN and K8V4_PREFIX_CACHING must be 0 or 1" >&2; exit 2;
@@ -151,6 +161,7 @@ docker_cmd=(docker run -d --name "$NAME" --restart=no \
   -v "${CACHE}:/root/.cache/vllm" \
   -v "${HERE}:/opt/k8v4/k8v4_v030:ro" \
   "${extra[@]}" \
+  "${w4a8_env[@]}" \
   -e PYTHONPATH=/opt/k8v4 \
   -e XE2_KV_LIB=/opt/k8v4/libxe2_kv.so \
   -e K8V4_SDPA_LIB=/opt/k8v4/libk8v4_sdpa.so \
