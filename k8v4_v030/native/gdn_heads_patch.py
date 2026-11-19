@@ -1,4 +1,4 @@
-"""Head-parallel schedule for two GDN prefill kernels of vllm-xpu-kernels 0.1.14.1.
+"""Head-parallel schedule for two GDN prefill kernels of vllm-xpu-kernels (0.1.14.1 and 0.1.17).
 
 chunk_compute_A_kernel and chunk_compute_wu_kernel give each work-group one
 64-token chunk and loop over all value heads (48 on Qwen3.8-27B) inside it.
