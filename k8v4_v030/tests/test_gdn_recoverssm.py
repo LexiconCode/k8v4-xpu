@@ -60,6 +60,7 @@ class KnobTest(unittest.TestCase):
 SOURCES = {
     patch.CONFIG: 'def f(self):\n' + patch._CONFIG_OLD + '        return kda_architectures\n',
     patch.MODEL: patch._CAUSAL_OLD + '\n\n' + patch._COND_OLD,
+    patch.MTP: 'LocalArgmaxMixin = object\n\n\n' + patch._MTP_OLD + '    pass\n',
     patch.PKG: '"""doc"""\n\n' + patch._PKG_OLD,
     patch.LAYER: 'class QwenGatedDeltaNetAttention:\n    pass\n\n\ndef direct_register_custom_op(**kw):\n    pass\n\n\n'
                  'def qwen_gdn_attention_core_fused_norm_packed():\n    pass\n\n\n' + patch._LAYER_OLD,
@@ -88,6 +89,7 @@ class PatchTest(unittest.TestCase):
             self.assertTrue(all(n.endswith(':unchanged') for n in notes), notes)
             self.assertEqual(text, {rel: (root / rel).read_text() for rel in SOURCES})
             self.assertEqual(text[patch.MODEL].count('supports_replayssm = True'), 2)
+            self.assertEqual(text[patch.MTP].count('supports_replayssm = True'), 1)
             self.assertIn('_k8v4_rssm_install(QwenGatedDeltaNetAttention)', text[patch.LAYER])
             self.assertIn('return\n\n    torch.ops._xpu_C.gdn_attention(', text[patch.OPS])
 
