@@ -143,7 +143,8 @@ def effort_in(prompt):
     for level in ("xhigh", "medium", "low"):
         if "Reasoning effort is set to %s" % level in prompt:
             return level
-    return "none-stated"
+    # The Qwen3.8 templates state xhigh and low; medium adds no line.
+    return "medium (no effort line)" if prompt.rstrip().endswith("<think>") else "thinking off"
 
 
 def check_models():
