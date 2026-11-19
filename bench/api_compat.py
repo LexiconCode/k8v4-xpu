@@ -4,7 +4,8 @@ What an agent platform relies on, checked one request at a time: the served mode
 rendered prompt (default reasoning effort, accepted effort values, non-leading system messages), tool calls
 with tool_choice auto / required / named, json_schema structured output, streamed tool calls with a usage
 chunk, thinking on/off, prompt_tokens_details.cached_tokens on a repeated prompt, four concurrent streamed
-requests with thinking, and whether an idle keep-alive connection survives a pause.
+requests with thinking, images per request (count and a 1920x1080 screenshot's token cost), and whether an idle
+keep-alive connection survives a pause.
 
 Prints one ``COMPAT <name> <PASS|FAIL|INFO> <detail>`` line per check and a final JSON line.
 Usage: python3 -I api_compat.py BASE_URL [MODEL]   (stdlib only; e.g. http://127.0.0.1:8002 qwen38)
@@ -312,6 +313,36 @@ def check_concurrent():
     record("concurrent4_stream_thinking", ok, "%.1fs %s" % (time.time() - t0, " ".join(rows)))
 
 
+def _png(width, height, rgb):
+    """A solid-colour PNG as a data URL (stdlib only)."""
+    import base64
+    import struct
+    import zlib
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+    raw = b"".join(b"\x00" + bytes(rgb) * width for _ in range(height))
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+    return "data:image/png;base64," + base64.b64encode(png).decode()
+
+
+def check_images():
+    """Agent screenshots pile up in a conversation: how many images per request, and how big."""
+    img = {"type": "image_url", "image_url": {"url": _png(64, 64, (200, 30, 30))}}
+    for count in (1, 5):
+        content = [img] * count + [{"type": "text", "text": "What colour are these images? One word."}]
+        status, out = chat([{"role": "user", "content": content}], max_tokens=16, chat_template_kwargs=OFF)
+        detail = (msg_of(out).get("content") or "")[:30] if status == 200 else str(out)[:120]
+        record("images_%d" % count, status == 200 if count == 1 else None, "status %s %r" % (status, detail))
+    big = {"type": "image_url", "image_url": {"url": _png(1920, 1080, (30, 30, 200))}}
+    status, out = chat([{"role": "user", "content": [big, {"type": "text", "text": "Colour? One word."}]}],
+                       max_tokens=8, chat_template_kwargs=OFF)
+    record("image_1920x1080_tokens", None, "status %s prompt_tokens=%s"
+           % (status, (out.get("usage") or {}).get("prompt_tokens")))
+
+
 def check_keepalive():
     u = urllib.parse.urlparse(BASE)
     conn = http.client.HTTPConnection(u.hostname, u.port, timeout=60)
@@ -330,7 +361,7 @@ def check_keepalive():
 
 def main():
     for check in (check_models, check_template, check_tools, check_json_schema, check_stream_tools,
-                  check_thinking, check_cached_tokens, check_concurrent, check_keepalive):
+                  check_thinking, check_cached_tokens, check_concurrent, check_images, check_keepalive):
         try:
             check()
         except Exception as err:  # one failing check must not hide the others
