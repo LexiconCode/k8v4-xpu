@@ -182,6 +182,17 @@ if [ "$PREFIX_CACHING" = 1 ]; then
 else
   prefix+=(--no-enable-prefix-caching --mamba-cache-mode=none)
 fi
+# Optional GDN recurrent-state dtype (docs/2026-11-19-decode-push.md). Unset keeps vLLM's choice, which for
+# Qwen3.5-family checkpoints is the config's mamba_ssm_dtype (float32 in the Swift bake). float16 halves the
+# state bytes every decode step reads and writes (4.8 -> ~2.6 ms of GDN per 4 x 63K step on one B70) and
+# changes numerics. Off unless set.
+mamba=()
+if [ -n "${K8V4_MAMBA_SSM_DTYPE:-}" ]; then
+  [[ "$K8V4_MAMBA_SSM_DTYPE" =~ ^(float32|float16|bfloat16)$ ]] || {
+    echo "K8V4_MAMBA_SSM_DTYPE must be float32, float16 or bfloat16" >&2; exit 2;
+  }
+  mamba+=(--mamba-ssm-cache-dtype="$K8V4_MAMBA_SSM_DTYPE")
+fi
 if [ "$TP" = 2 ]; then
   extra+=(
     -e CCL_SYCL_ALLREDUCE_LL=twoshots
@@ -347,6 +358,7 @@ docker_cmd=(docker run -d --name "$NAME" --restart=no \
   --tool-call-parser=qwen3_xml \
   --reasoning-parser=qwen3 \
   "${prefix[@]}" \
+  "${mamba[@]}" \
   "${multimodal[@]}" \
   --trust-remote-code \
   --speculative-config="$SPEC_CONFIG" \

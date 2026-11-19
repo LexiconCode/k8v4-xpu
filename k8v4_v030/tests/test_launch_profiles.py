@@ -242,6 +242,20 @@ class LaunchProfileTest(unittest.TestCase):
             with self.subTest(bad=bad):
                 result, _ = self.command(K8V4_TP='1', **bad)
                 self.assertEqual(result.returncode, 2)
+    def test_mamba_ssm_dtype_is_passed_only_when_set(self):
+        _, default = self.command(K8V4_TP='1')
+        self.assertFalse([arg for arg in default if arg.startswith('--mamba-ssm-cache-dtype')])
+        for dtype in ('float16', 'bfloat16', 'float32'):
+            with self.subTest(dtype=dtype):
+                result, args = self.command(K8V4_TP='1', K8V4_MAMBA_SSM_DTYPE=dtype)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('--mamba-ssm-cache-dtype=%s' % dtype, args)
+                self.assertEqual(len(args), len(default) + 1)
+        for bad in ('fp16', 'half', 'auto', 'float16 '):
+            with self.subTest(bad=bad):
+                result, args = self.command(K8V4_TP='1', K8V4_MAMBA_SSM_DTYPE=bad)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(b'K8V4_MAMBA_SSM_DTYPE', result.stderr)
 
     def test_onednn_deterministic_is_passed_only_when_set(self):
         result, default = self.command(K8V4_TP='1')
