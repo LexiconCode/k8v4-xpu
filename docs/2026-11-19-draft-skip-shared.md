@@ -49,9 +49,23 @@ anchors match vLLM 0.30 and stock `vllm/vllm-openai-xpu:v0.34.0` unchanged (chec
 
 ## Measurements
 
-Not measured yet: the 0.30 window was cancelled when the target moved to vLLM 0.34. To measure:
+All runs: one B70 at 230 W (no power change), vLLM 0.34 base (`b70/test-v034` @1508198 plus these
+three branches, image `k8v4-up:memload034-d692083`), TP1 profile with `K8V4_MAX_SEQS=4`, prefix caching,
+max-model-len 131072, util 0.96, `K8V4_UPLOAD_SLICE_MB=128`. One start each, 2026-11-19 10:58-11:20 UTC
+(runs m4A-m4D). For the 63K users test, the base row is the 0.34 base run v034base (same code, knobs unset,
+09:50 UTC).
 
-- the draft's "Loading weights took" line, the knob unset vs set;
-- "Model loading took N GiB": should be unchanged, because the copies were freed before;
-- whether the second `[swift-embed-int8]` line shows the 1-row draft table;
-- start reliability over several starts without `K8V4_UPLOAD_SLICE_MB`.
+| | knobs unset (m4A) | EMBED_HOST=1 + DRAFT_SKIP_SHARED=1 (m4B) | same + GEMM_WARMUP (m4C) |
+|---|---|---|---|
+| draft "Loading weights took" | 6.55 s | 0.06 s | 0.07 s |
+| skipped checkpoint tensors | - | 5 (2.98 GiB) | 5 (2.98 GiB) |
+| second `[swift-embed-int8]` (draft) table | (248320, 5120) on the device | (64, 5120) placeholder | (64, 5120) |
+| starts | 1/1 | 1/1 | 1/1 |
+| EXACT | 8/9 | 8/9 | 8/9 |
+
+- The draft load drops from 6.5 s to under 0.1 s. Three host-to-device copies of 0.6-2.4 GiB each
+  are no longer made at all.
+- The target's own load time varies with the page cache (31 s cold in m4A, 4-14 s in later runs), so
+  only the draft line is compared.
+- KV is unchanged by this knob alone; the KV gain in m4B comes from `K8V4_EMBED_HOST`.
+- Start reliability without `K8V4_UPLOAD_SLICE_MB` was not tested: one start per configuration.
