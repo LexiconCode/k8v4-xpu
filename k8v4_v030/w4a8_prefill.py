@@ -329,6 +329,9 @@ def _quantize_grouped(flat: torch.Tensor, group: int):
 
 
 _GROUPED_COMPILED = None
+# k8v4_v030.w4a8_triton once K8V4_W4A8_KERNEL=onednn is installed on XPU; None
+# keeps the compiled-torch quantizers (the CPU tests use those).
+_TRITON = None
 
 
 def _lib():
@@ -342,7 +345,12 @@ def _s4_runtime(flat, packed, scales, group_size, bias, large):
         out = ops.int4_gemm_w4a16(flat, packed, scales, None, group_size)
     else:
         bf16 = flat.dtype == torch.bfloat16
-        if _AGROUP:
+        if _TRITON is not None:
+            if _AGROUP:
+                quant_x, x_scale = _TRITON.quantize_groups(flat, _AGROUP)
+            else:
+                quant_x, x_scale = _TRITON.quantize_rows(flat)
+        elif _AGROUP:
             global _GROUPED_COMPILED
             if _GROUPED_COMPILED is None:
                 _GROUPED_COMPILED = torch.compile(_quantize_grouped, dynamic=True, fullgraph=True)
@@ -438,9 +446,12 @@ def _silu_body(gate_up, packed, scales, zeros, group_size):
     if not (_RUNTIME_ENABLED and _AGROUP and flat.shape[0] > SMALL_M_MAX):
         return _runtime_mlp_body(_silu_and_mul(flat), packed, scales, zeros, group_size, None)
     global _SILU_COMPILED
-    if _SILU_COMPILED is None:
-        _SILU_COMPILED = torch.compile(_silu_quantize_grouped, dynamic=True, fullgraph=True)
-    quant_x, x_scale = _SILU_COMPILED(flat, _AGROUP)
+    if _TRITON is not None:
+        quant_x, x_scale = _TRITON.silu_quantize_groups(flat, _AGROUP)
+    else:
+        if _SILU_COMPILED is None:
+            _SILU_COMPILED = torch.compile(_silu_quantize_grouped, dynamic=True, fullgraph=True)
+        quant_x, x_scale = _SILU_COMPILED(flat, _AGROUP)
     out = _lib().int4_gemm_w4a8(quant_x, x_scale, None, packed, scales, None, group_size, None,
                                 flat.dtype == torch.bfloat16)
     return out if out.dtype == flat.dtype else out.to(dtype=flat.dtype)
@@ -500,9 +511,12 @@ def _gnorm_body(o, z, weight, eps, activation, packed, scales, zeros, group_size
         return _runtime_mlp_body(_gnorm(o, z, weight, eps, activation), packed, scales, zeros,
                                  group_size, None)
     global _GNORM_COMPILED
-    if _GNORM_COMPILED is None:
-        _GNORM_COMPILED = torch.compile(_gnorm_quantize_grouped, dynamic=True, fullgraph=True)
-    quant_x, x_scale = _GNORM_COMPILED(o, z, weight, eps, activation, _AGROUP)
+    if _TRITON is not None:
+        quant_x, x_scale = _TRITON.gnorm_quantize_groups(o, z, weight, eps, activation, _AGROUP)
+    else:
+        if _GNORM_COMPILED is None:
+            _GNORM_COMPILED = torch.compile(_gnorm_quantize_grouped, dynamic=True, fullgraph=True)
+        quant_x, x_scale = _GNORM_COMPILED(o, z, weight, eps, activation, _AGROUP)
     out = _lib().int4_gemm_w4a8(quant_x, x_scale, None, packed, scales, None, group_size, None,
                                 o.dtype == torch.bfloat16)
     return out if out.dtype == o.dtype else out.to(dtype=o.dtype)
@@ -695,7 +709,7 @@ def remove_import_hook(finder=None) -> None:
 
 def install_if_requested() -> None:
     """Install before model compilation; cached opaque calls honor opt-out too."""
-    global _RUNTIME_ENABLED, _LAYERS, _KERNEL, _AGROUP, _FUSED, _GNORM_STATIC
+    global _RUNTIME_ENABLED, _LAYERS, _KERNEL, _AGROUP, _FUSED, _GNORM_STATIC, _TRITON
     mode = os.environ.get("K8V4_PREFILL_GEMM", "w4a16")
     if mode not in ("w4a16", "w4a8"):
         raise RuntimeError("K8V4_PREFILL_GEMM must be w4a16 or w4a8")
@@ -712,6 +726,13 @@ def install_if_requested() -> None:
             if not os.path.isfile(path):
                 raise RuntimeError("K8V4_W4A8_KERNEL=onednn needs the library at %s" % path)
             torch.ops.load_library(path)
+            quant = os.environ.get("K8V4_W4A8_QUANT", "triton")
+            if quant not in ("triton", "torch"):
+                raise RuntimeError("K8V4_W4A8_QUANT must be triton or torch, got %s" % quant)
+            if quant == "triton":
+                from k8v4_v030 import w4a8_triton
+
+                _TRITON = w4a8_triton
             sys.stderr.write("k8v4_w4a8: s4 weights via %s (oneDNN %s), activation group %s\n"
                              % (path, torch.ops.k8v4_w4a8.onednn_version(),
                                 _AGROUP or "per token"))
