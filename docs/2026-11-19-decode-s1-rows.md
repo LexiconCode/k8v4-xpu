@@ -38,6 +38,9 @@ PV phase is the largest single cost: every sub-group loads all row tiles of P fr
   feeds all of its row tiles.
 - P and the decoded V half are stored as contiguous 8x16 / 16x16 blocks, so each `joint_matrix_load` from SLM
   reads one contiguous run (q7: 459 -> 411 us at 63K, 882 -> 776 us at 128K; q1 / q4 unchanged).
+- Up to 3 live row tiles (q2-q4): each sub-group keeps its P fragments in registers for both V halves instead of
+  loading them from SLM twice (q4 at 63K 286 -> 273 us, 128K 531 -> 505 us, two runs each; the table below was
+  measured before this step, and so was the end-to-end run).
 - Same SLM tile as the multi-page kernel plus 64 bytes; large GRF as before. `launch.sh` passes the variable
   only when set and rejects anything but `0` / `1`; the C++ side rejects other values too.
 
@@ -63,6 +66,8 @@ process on identical data). Read floor = K int8 + V int4 + 3 scales = 396 B per 
 | 16K q4 | 222 | 173 | 111 | **100** | -10% | |
 | 16K q7 | 298 | 215 | 149 | **140** | -6% | |
 | 2K q1 / q4 / q7 | 42 / 64 / 76 | 42 / 61 / 69 | 34 / 43 / 56 | **33 / 44 / 55** | | |
+
+With the P-in-registers step: 63K q4 273 us (61% of the floor), 128K q4 505 us (67%).
 
 `XE2_KV_S1_GRF=128` with FAST: q4/q7 spill and run 2.9-3.6x slower (q7 63K 1466 us); `SPLITS=40` with 128
 registers: same (q1 235, q4 287, q7 1293 us at 63K). Large GRF stays the right default.
@@ -98,6 +103,25 @@ per-row visible lengths with a 97-token stagger, permuted block table, NaN-fille
 - HKV 2, 16000 / 4097, q 1 / 7, `SPLITS=64` + FAST: 6.1e-5.
 - `tests/test_kernel_xpu.py` (6 tests) pass with `XE2_KV_S1_SPLITS=32 XE2_KV_S1_FAST=1`;
   `tests/test_launch_profiles.py` passes (new test: passed only when set, `0`/`1` only).
+
+## How far from the floor, and what is left
+
+At 63K the op now runs at 70% (q1), 61% (q4) and 40% (q7) of the KV read floor; at 128K 76% / 67% / 42%. The
+phase table explains why it stops there: each work-group walks its pages through one serial chain (K load,
+QK, barrier, softmax, barrier, V decode, barrier, PV, twice for the V halves) and only 4 work-groups fit on an
+Xe-core with 256 registers, so the chain latency, not DRAM bandwidth, sets the time. Every way tried here to
+overlap the next page (registers, cache prefetch, a larger SLM tile) either spills or costs occupancy. Closing
+the rest (>= 85%) needs a different structure, in order of expected value:
+
+1. Producer / consumer sub-groups with a double-buffered raw (undecoded) page in SLM, so loads of page j + 1
+   run while page j is in QK / PV (needs about 24 KB more SLM per work-group; check whether 3 work-groups per
+   Xe-core with full overlap beat 4 without).
+2. Softmax straight from the QK accumulators (one sub-group per row tile), removing the S round trip through SLM
+   and one barrier per page; the other sub-groups decode V meanwhile.
+3. V decode folded into P (P x scale per token, raw nibbles as exact halves, the zero point as a per-row
+   correction), which removes most of the decode ALU work.
+4. One launch for all requests of `int8k_int4v_attn_batch` (per-request q-pack / S2 launches are about 1.7 ms of
+   a 4-user step at 63K in the profile).
 
 ## What did not help
 
