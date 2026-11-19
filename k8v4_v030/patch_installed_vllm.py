@@ -85,16 +85,33 @@ _EMBED_COPY_NEW = (
 )
 
 
+# vLLM 0.34 routes the same copy through model_executor.utils.copy_weight_
+# (a plain copy_ off integrated GPUs).
+_EMBED_COPY_OLD_034 = '        copy_weight_(param[: loaded_weight.shape[0]].data, loaded_weight)\n'
+_EMBED_COPY_NEW_034 = (
+    '        try:  # k8v4: K8V4_UPLOAD_SLICE_MB (default 0 = this same copy_weight_)\n'
+    '            from k8v4_v030.upload import copy_rows as _k8v4_copy_rows\n'
+    '        except ImportError:\n'
+    '            _k8v4_copy_rows = None\n'
+    '        if _k8v4_copy_rows is None:\n'
+    '            copy_weight_(param[: loaded_weight.shape[0]].data, loaded_weight)\n'
+    '        else:\n'
+    '            _k8v4_copy_rows(param[: loaded_weight.shape[0]].data, loaded_weight)\n'
+)
+
+
 def _splice_embed_copy(path: Path) -> str:
     """Route VocabParallelEmbedding.weight_loader's table copy through k8v4_v030.upload.copy_rows,
     which is a plain copy_ unless K8V4_UPLOAD_SLICE_MB is set (see k8v4_v030/upload.py)."""
     text = path.read_text(encoding='utf-8')
     if '_k8v4_copy_rows' in text:
         return 'unchanged'
-    if text.count(_EMBED_COPY_OLD) != 1:
-        raise RuntimeError('%s embed copy anchor count %d' % (path, text.count(_EMBED_COPY_OLD)))
-    path.write_text(text.replace(_EMBED_COPY_OLD, _EMBED_COPY_NEW, 1), encoding='utf-8')
-    return 'patched'
+    for old, new in ((_EMBED_COPY_OLD, _EMBED_COPY_NEW), (_EMBED_COPY_OLD_034, _EMBED_COPY_NEW_034)):
+        if text.count(old) == 1:
+            path.write_text(text.replace(old, new, 1), encoding='utf-8')
+            return 'patched'
+    raise RuntimeError('%s embed copy anchor count %d (0.30) / %d (0.34)'
+                       % (path, text.count(_EMBED_COPY_OLD), text.count(_EMBED_COPY_OLD_034)))
 
 
 _DEFAULT_ROOTS = (

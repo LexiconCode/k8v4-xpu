@@ -11,7 +11,13 @@ from unittest import mock
 import torch
 
 from k8v4_v030 import upload
-from k8v4_v030.patch_installed_vllm import _EMBED_COPY_NEW, _EMBED_COPY_OLD, _splice_embed_copy
+from k8v4_v030.patch_installed_vllm import (
+    _EMBED_COPY_NEW,
+    _EMBED_COPY_NEW_034,
+    _EMBED_COPY_OLD,
+    _EMBED_COPY_OLD_034,
+    _splice_embed_copy,
+)
 
 
 class SliceTest(unittest.TestCase):
@@ -69,6 +75,17 @@ class EmbedSpliceTest(unittest.TestCase):
             self.assertIn(_EMBED_COPY_NEW, text)
             self.assertEqual(_splice_embed_copy(path), "unchanged")
             self.assertEqual(path.read_text(encoding="utf-8"), text)
+            compile(text, str(path), "exec")
+
+    def test_splice_once_034(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vocab_parallel_embedding.py"
+            path.write_text("def weight_loader(self, param, loaded_weight):\n" + _EMBED_COPY_OLD_034
+                            + "        param[loaded_weight.shape[0] :].data.fill_(0)\n", encoding="utf-8")
+            self.assertEqual(_splice_embed_copy(path), "patched")
+            text = path.read_text(encoding="utf-8")
+            self.assertIn(_EMBED_COPY_NEW_034, text)
+            self.assertEqual(_splice_embed_copy(path), "unchanged")
             compile(text, str(path), "exec")
 
     def test_missing_anchor_raises(self):
