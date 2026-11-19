@@ -135,3 +135,26 @@ vLLM 0.34 passes the scheduled depth to the speculator natively. The 0.30-only f
   the K8/V4 attention backend, so it could land as new files plus splices once their 0.34 base
   serves. It is what lets every user draft deep (all copying 4x63K 274 -> 464 tok/s on our stack).
 - Per-batch draft depth: native in vLLM 0.34.
+
+## Draft vocabulary with the W4A8 s4 head (fix, measured on `b70/all-034` config A)
+
+With `K8V4_W4A8_LAYERS=all K8V4_W4A8_KERNEL=onednn` the target's lm_head (layer family `other`) is flipped at
+load to s4 nibbles with an empty zero point, and the MTP draft shares that head (the shared-table path, with or
+without `K8V4_DRAFT_SKIP_SHARED`). The first version refused it ("only the symmetric int4 head is supported").
+The subset now keeps whichever form the head is in (`int4_form`): u4 with one zero point 8 runs the stock
+`_xpu_C.int4_gemm_w4a16`, s4 runs `k8v4_w4a8.int4_gemm_w4a16`, the op the head itself decodes with, on the same
+packed rows and scales. Still lossless.
+
+Config A of `b70/all-034` (image `k8v4-up:all034-575ee85`, source `b70/test-vocab-all034` = all-034 + this fix),
+`K8V4_MTP_SHARED_DEPTH=3`, plus `K8V4_DRAFT_VOCAB` (64K ids):
+
+| | all034A | + draft vocab (gapVf) |
+|---|---|---|
+| KV tokens | 388,696 | 384,176 |
+| exact | 8/9 | 8/9 |
+| 1 user decode (gap p50) | 73.6 tok/s (49 ms) | 82.5 tok/s (44 ms), +12% |
+| 4 users aggregate (gap p50) | 171.7 tok/s | 184.8 tok/s (63 ms), +7.6% |
+| coding client decode, 2K / 8K / 32K / 128K | 124 / 124 / 119 / 89 | 141 / 139 / 126 / 98 |
+
+Same with `K8V4_MTP_SHARED_DEPTH=4` (gapV4f, 4 users only): 164.4 tok/s aggregate, below depth 3.
+Coding-client numbers are the mean `decode_tok_s` of the three non-warmup trials per length.
