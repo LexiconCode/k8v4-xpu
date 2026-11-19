@@ -12,10 +12,10 @@ mkdir -p "$ROOT/build"
 docker run --rm --memory=1200m --memory-swap=4g --entrypoint bash \
   -v "$ROOT/k8v4_v030/native:/src:ro" \
   -v "$ROOT/build:/out" \
-  k8v4-compile-2026 -lc '
+  "${K8V4_COMPILE_IMAGE:-k8v4-compile-2026}" -lc '
 set -euo pipefail
 ICPX=""
-for c in /opt/intel-2026/oneapi/compiler/2026.0/bin/icpx /opt/intel-2026/oneapi/compiler/latest/bin/icpx; do
+for c in /opt/intel-2026/oneapi/compiler/2026.1/bin/icpx /opt/intel-2026/oneapi/compiler/2026.0/bin/icpx /opt/intel-2026/oneapi/compiler/latest/bin/icpx; do
   if [ -x "$c" ]; then ICPX=$c; break; fi
 done
 test -n "$ICPX"
