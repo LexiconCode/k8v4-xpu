@@ -47,6 +47,23 @@ class TritonQuantTest(unittest.TestCase):
         q, s = tr.gnorm_quantize_groups(o, z, w, 1e-6, "silu", 64)
         self.check(q, s, _ref_gated(o, z, w, 1e-6), 64)
 
+    def test_gnorm_decode_rows(self):
+        """K8V4_W4A8_FUSED=gnorm's decode side: the one-launch gated norm against forward_static's arithmetic."""
+        from k8v4_v030 import w4a8_triton as tr
+
+        for dtype in (torch.float16, torch.bfloat16):
+            for rows in (1, 7, 16, 64, 128):
+                o = torch.randn(rows, 48, 128, device="xpu").to(dtype)
+                z = (torch.randn(rows, 48, 128, device="xpu") * 2).to(dtype)
+                w = (torch.rand(128, device="xpu") + 0.5).to(dtype)
+                y = tr.gnorm(o, z, w, 1e-6, "silu")
+                ref = _ref_gated(o, z, w, 1e-6)
+                self.assertEqual(y.shape, ref.shape)
+                self.assertEqual(y.dtype, dtype)
+                # one rounding of the same fp32 value: at most one unit in the last place of the output dtype
+                ulp = ref.float().abs().clamp(min=1e-3) * (2.0 ** -10 if dtype == torch.float16 else 2.0 ** -7)
+                self.assertTrue(bool(((y.float() - ref.float()).abs() <= ulp).all()))
+
 
 if __name__ == "__main__":
     unittest.main()

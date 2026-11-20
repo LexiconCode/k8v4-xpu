@@ -113,6 +113,29 @@ def _gnorm_q8_group_kernel(o_ptr, z_ptr, w_ptr, q_ptr, s_ptr, K, NG, eps, SIGMOI
         tl.store(s_ptr + row * NG + goffs, s16)
 
 
+@triton.jit
+def _gnorm_kernel(o_ptr, z_ptr, w_ptr, y_ptr, K, eps, SIGMOID: tl.constexpr, BF16: tl.constexpr,
+                  D: tl.constexpr, BLOCK: tl.constexpr):
+    """_gnorm_q8_group_kernel without the quantizer, on a (row, block of heads) grid: the normed output itself."""
+    row = tl.program_id(0).to(tl.int64)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    base = row * K
+    w = tl.load(w_ptr + tl.arange(0, D)).to(tl.float32)
+    x = tl.reshape(tl.load(o_ptr + base + offs).to(tl.float32), (BLOCK // D, D))
+    zz = tl.reshape(tl.load(z_ptr + base + offs).to(tl.float32), (BLOCK // D, D))
+    var = tl.sum(x * x, 1) / D
+    y = x * tl.rsqrt(var + eps)[:, None] * w[None, :]
+    if SIGMOID:
+        y = y * tl.sigmoid(zz)
+    else:
+        y = y * (zz * tl.sigmoid(zz))
+    y = tl.reshape(y, (BLOCK,))
+    if BF16:
+        tl.store(y_ptr + base + offs, y.to(tl.bfloat16))
+    else:
+        tl.store(y_ptr + base + offs, y.to(tl.float16))
+
+
 def quantize_rows(x: torch.Tensor):
     """Per-token symmetric int8: (q [M, K], s [M, 1] fp16)."""
     x = x.contiguous()
@@ -145,6 +168,23 @@ def silu_quantize_groups(gate_up: torch.Tensor, group: int):
                                        BF16=gate_up.dtype == torch.bfloat16, G=group, BLOCK=BLOCK,
                                        num_warps=4)
     return q, s
+
+
+def gnorm(o: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float, activation: str):
+    """o, z [M, heads, D] -> RMSNormGated(o, z) (gate after the norm) flattened to [M, heads * D], o's dtype.
+
+    The small-row (decode / verify) side of K8V4_W4A8_FUSED=gnorm: one launch, as the compiled stock norm is,
+    instead of the eager forward_static's chain of elementwise kernels.
+    """
+    o, z = o.contiguous(), z.contiguous()
+    rows, heads, dim = o.shape
+    width = heads * dim
+    block = BLOCK if width % BLOCK == 0 and BLOCK % dim == 0 else dim
+    y = torch.empty((rows, width), dtype=o.dtype, device=o.device)
+    if rows:
+        _gnorm_kernel[(rows, width // block)](o, z, weight, y, width, eps, SIGMOID=activation == "sigmoid",
+                                              BF16=o.dtype == torch.bfloat16, D=dim, BLOCK=block, num_warps=4)
+    return y
 
 
 def gnorm_quantize_groups(o: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float,
