@@ -51,8 +51,9 @@ class KnobTest(unittest.TestCase):
         for kv in ({'K8V4_RSSM_VERIFY': 'slm'}, {'K8V4_RSSM_DEFER_COMMIT': '1'}):
             with self.env(**kv):
                 rssm_defer.check_window(7)
+                rssm_defer.check_window(15)  # deep copy drafting (K8V4_DEEP_DRAFT, depth 15)
                 with self.assertRaises(ValueError):
-                    rssm_defer.check_window(8)
+                    rssm_defer.check_window(16)
 
 
 _spec = importlib.util.spec_from_file_location('patch_rssm_defer_v030', ROOT / 'tools/patch_rssm_defer_v030.py')

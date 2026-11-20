@@ -27,7 +27,7 @@ from dataclasses import dataclass
 VERIFY_ENV = 'K8V4_RSSM_VERIFY'
 DEFER_ENV = 'K8V4_RSSM_DEFER_COMMIT'
 VERIFY_VALUES = ('', 'stock', 'slm')
-MAX_WINDOW = 8  # the SLM kernel's window bound (num_speculative_tokens + 1)
+MAX_WINDOW = 16  # the SLM kernel's window bound (num_speculative_tokens + 1; 16 = deep drafting at depth 15)
 
 
 def verify_mode() -> str:
