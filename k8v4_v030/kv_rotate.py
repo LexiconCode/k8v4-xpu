@@ -67,3 +67,17 @@ def rotate(x: torch.Tensor, dtype: torch.dtype | None = None) -> torch.Tensor:
     h = hadamard(D, x.device)
     y = torch.matmul(x.reshape(-1, D).to(torch.float32), h)
     return y.to(dtype or x.dtype).reshape(x.shape)
+
+
+_NOTED = False
+
+
+def note_once(rot_k: bool, rot_v: bool) -> None:
+    """One stderr line per process (the backend module logger is not a vllm.* logger, so vLLM drops it)."""
+    global _NOTED
+    if _NOTED:
+        return
+    _NOTED = True
+    import sys
+
+    sys.stderr.write("k8v4_kv_rotate: Hadamard-rotated cache, K %s, V %s (%s)\n" % (rot_k, rot_v, ENV))
