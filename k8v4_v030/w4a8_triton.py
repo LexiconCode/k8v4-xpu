@@ -114,6 +114,21 @@ def _gnorm_q8_group_kernel(o_ptr, z_ptr, w_ptr, q_ptr, s_ptr, K, NG, eps, SIGMOI
 
 
 @triton.jit
+def _silu_mul_kernel(gu_ptr, y_ptr, K, BF16: tl.constexpr, BLOCK: tl.constexpr):
+    """SiLU(gate) * up computed in fp32 and rounded once, as the compiled stock SiluAndMul does."""
+    row = tl.program_id(0).to(tl.int64)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < K
+    g = tl.load(gu_ptr + row * 2 * K + offs, mask=m, other=0.0).to(tl.float32)
+    u = tl.load(gu_ptr + row * 2 * K + K + offs, mask=m, other=0.0).to(tl.float32)
+    y = g * tl.sigmoid(g) * u
+    if BF16:
+        tl.store(y_ptr + row * K + offs, y.to(tl.bfloat16), mask=m)
+    else:
+        tl.store(y_ptr + row * K + offs, y.to(tl.float16), mask=m)
+
+
+@triton.jit
 def _gnorm_kernel(o_ptr, z_ptr, w_ptr, y_ptr, K, eps, SIGMOID: tl.constexpr, BF16: tl.constexpr,
                   D: tl.constexpr, BLOCK: tl.constexpr):
     """_gnorm_q8_group_kernel without the quantizer, on a (row, block of heads) grid: the normed output itself."""
@@ -168,6 +183,17 @@ def silu_quantize_groups(gate_up: torch.Tensor, group: int):
                                        BF16=gate_up.dtype == torch.bfloat16, G=group, BLOCK=BLOCK,
                                        num_warps=4)
     return q, s
+
+
+def silu_mul(gate_up: torch.Tensor) -> torch.Tensor:
+    """[M, 2K] -> SiLU(gate) * up [M, K] in gate_up's dtype (the small-row side of K8V4_W4A8_FUSED=silu)."""
+    gate_up = gate_up.contiguous()
+    rows, width = gate_up.shape[0], gate_up.shape[1] // 2
+    y = gate_up.new_empty((rows, width))
+    if rows:
+        _silu_mul_kernel[(rows, triton.cdiv(width, BLOCK))](gate_up, y, width, BF16=gate_up.dtype == torch.bfloat16,
+                                                           BLOCK=BLOCK, num_warps=4)
+    return y
 
 
 def gnorm(o: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float, activation: str):
