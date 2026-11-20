@@ -92,6 +92,83 @@ tok/s differences are larger than the step change because the outputs differ (FA
 acceptance moves with the text; the one-user 76.5 vs 82.5 between two baseline runs shows that spread. Depth
 check (accepted per draft): baseline 1.41 / 1.30 / 1.46, FAST 1.56 / 1.26 / 1.42.
 
+## Round 2 (2026-11-20): one launch for all requests, and the restructures
+
+### `XE2_KV_BATCH_REQS=1`: one q-pack, one S1 and one S2 launch per batch
+
+`int8k_int4v_attn_batch` looped over the requests on the host (q-pack, S1, S2 each). With
+`XE2_KV_BATCH_REQS=1` (multi-page S1 only; 0/1, `launch.sh` passes it only when set) the batch runs as one
+launch of each: request r owns S1 programs `r * groups * HKV ...`, its own Q tile, block-table row and
+seq / visible lengths, and the S2 merge maps each output token to its request. The per-request Q tiles live in
+the unused tail of the caller's partials workspace, so nothing is allocated (graph capture is safe); when the
+workspace is too small, the two-pass S2 is selected or the path does not apply, the loop runs as before. Same
+arithmetic as the per-request path.
+
+Kernel, 4 requests (lengths L, L - 37, L - 74, L - 111, own pages each), one op per graph, us:
+
+| context | q1 loop / batched | q4 loop / batched | q7 loop / batched |
+|---|---:|---:|---:|
+| 128K | 1785 / 1645 (-8%) | 2083 / 2020 (-3%) | 3270 / 3207 (-2%) |
+| 63K | 949 / 824 (-13%) | 1112 / 1024 (-8%) | 1703 / 1631 (-4%) |
+| 16K | 334 / 250 (-25%) | 402 / 345 (-14%) | 577 / 525 (-9%) |
+
+Correctness, 4 requests, 16000 / 4097 / 130 tokens, q 1 / 4 / 7, against the per-request one-page kernel:
+9.8e-4 (FAST, plain SPLITS, fp16 partials, PAGES=8); one request through the batched path 6.1e-5.
+
+### End to end, second round (same config as above, CODING=0, one lock hold)
+
+| run | 1 user | gap p50 | 4 users aggregate | gap p50 | accepted per draft (depth check) |
+|---|---:|---:|---:|---:|---|
+| `s1vB2` baseline | 75.0 tok/s | 44 ms | 181.0 tok/s | 63 ms | 1.51 / 1.35 / 1.46 |
+| `s1vF2` FAST (with P in registers) | 79.3 tok/s | 43 ms | 193.6 tok/s | 59 ms | 1.45 / 1.23 / 1.47 |
+| `s1vFB` FAST + `XE2_KV_BATCH_REQS=1` | 76.7 tok/s | 43 ms | 198.0 tok/s | 58 ms | 1.46 / 1.31 / 1.46 |
+
+The P-in-registers step is confirmed end to end: the four-user step is 59 ms with it (`s1vF2`) against 60 ms
+without (`s1vF`, first round) and 63 ms for both baselines. Batching the requests takes the four-user step to
+58 ms. One user stays at 43 ms (batch of one).
+
+### Softmax straight from the QK accumulators (measured, not adopted)
+
+Sub-group t < T computed all 64 scores of row tile t and ran the lazy softmax on the accumulator registers
+(element i of a lane's 8x16 accumulator is row i), writing only P to SLM; the other sub-groups decoded the first
+V half meanwhile (one barrier less per page, no S round trip). Correct (9.8e-4), but slower everywhere, because
+QK then runs on T sub-groups instead of 8 (one at q1): 63K 330 / 352 / 496 us against 236 / 276 / 417, 128K
+619 / 652 / 958 against 436 / 505 / 798. Removed again.
+
+### Double-buffered V (measured, not adopted)
+
+A second 16 KB V buffer: V half 1 of page j decoded into the dead S region next to the half-0 PV, half 0 of
+page j + 1 into the second buffer next to the half-1 PV (4 barriers per page instead of 6, decode overlapped with
+PV). Correct (9.8e-4) but the 40 KB tile drops occupancy from 4 to 3 work-groups per Xe-core and that loses more
+than the overlap wins: 63K 361 / 460 / 770 us against 237 / 275 / 415. A producer / consumer split with a raw
+page buffer needs at least as much SLM and fewer computing sub-groups (the accumulator-softmax result above), so
+it was not built.
+
+### V scale folded into P (measured, not adopted)
+
+P' = P x scale per token, the V tile holds the raw nibbles as exact halves (0x6400 | n minus 1024), and the zero
+point is a per-row correction (sum of P' x zero, rescaled like the row sum). The decode becomes bit work only,
+but the per-token scale / zero loads and the extra multiply move into the softmax, which sits on the same chain:
+63K 264 / 299 / 438 us against 237 / 275 / 415, and the causal cases differ by up to 2.0e-3 (two fp16 steps)
+instead of 9.8e-4. Removed again.
+
+### Also measured in round 2 (not adopted)
+
+- Q fragments in registers for the whole program (the Q tile is the same on every page; up to 3 row tiles):
+  q4 slower, 63K 274 -> 341 us, 128K 506 -> 634 us (register pressure next to the P fragments and accumulators);
+  q1 unchanged.
+- Split count with four batched requests at 63K (q1 / q4, us): 32 splits 839 / 1040, 16: 867 / 1069,
+  8: 876 / 1072, 24: 865 / 1062, 64: 917 / 1136. 32 stays best.
+
+### Where this leaves the four-user step
+
+Config A + vocab + deterministic oneDNN: 63 ms (baseline) -> 59 ms (FAST) -> 58 ms (FAST + batched requests);
+the target (under our stack's 55 ms) needs about 3 ms more. In the kernel, every restructure tried in this round
+that shortens the per-page chain (softmax from the accumulators, a second V buffer, folded V scale, Q in
+registers) costs more in occupancy, registers or work on the same chain than it saves; what helped is removing
+launches (batched requests) and SLM traffic (blocked tiles, P in registers). The remaining distance to the read
+floor at q4 (63K: 256 us per request batched against 167) is spread over all four phases of the page chain.
+
 ## Correctness
 
 Same process, identical data, against the one-page PR3 kernel with fp32 partials (eager, graph replay, causal
