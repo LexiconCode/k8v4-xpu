@@ -140,6 +140,35 @@ class GnormTest(unittest.TestCase):
                              torch.empty(0, dtype=torch.int8), 128)
         self.assertEqual(seen, [("w4a8", (200, 512), (200, 8)), ("w4a16", (7, 512))])
 
+    def test_gnorm_small_rows_one_triton_launch(self):
+        """Decode-size rows take the Triton gated norm (one launch), never the eager forward_static."""
+        o = torch.randn(7, 4, 128).to(torch.bfloat16)
+        z = torch.randn(7, 4, 128).to(torch.bfloat16)
+        w = torch.rand(128).to(torch.bfloat16)
+        seen = []
+
+        class Triton:
+            @staticmethod
+            def gnorm(o_, z_, w_, eps, activation):
+                seen.append(("gnorm", tuple(o_.shape), activation))
+                return _gated_reference(o_, z_, w_, eps, o_.dtype).reshape(o_.shape[0], -1)
+
+        class Ops:
+            @staticmethod
+            def int4_gemm_w4a16(a, b, s, zp, g):
+                seen.append(("w4a16", tuple(a.shape)))
+                return torch.zeros(a.shape[0], b.shape[1], dtype=a.dtype)
+
+        def no_static(*args):
+            raise AssertionError("eager forward_static on decode rows")
+
+        packed = torch.zeros(64, 5, dtype=torch.int32)
+        with patch.object(gemm, "_GNORM_STATIC", no_static), patch.object(gemm, "_lib", lambda: Ops), \
+             patch.object(gemm, "_RUNTIME_ENABLED", True), patch.object(gemm, "_AGROUP", 64), \
+             patch.object(gemm, "_TRITON", Triton):
+            gemm._gnorm_body(o, z, w, 1e-6, "silu", packed, torch.ones(1, 5), torch.empty(0, dtype=torch.int8), 128)
+        self.assertEqual(seen, [("gnorm", (7, 4, 128), "silu"), ("w4a16", (7, 512))])
+
 
 def _gemma_reference(x, residual, weight, eps):
     """vLLM GemmaRMSNorm.forward_native with a residual, written out."""

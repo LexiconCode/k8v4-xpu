@@ -511,8 +511,14 @@ def _gnorm_quantize_grouped(o, z, weight, eps: float, activation: str, group: in
 
 def _gnorm_body(o, z, weight, eps, activation, packed, scales, zeros, group_size):
     if not (_RUNTIME_ENABLED and _AGROUP and o.shape[0] > SMALL_M_MAX):
-        return _runtime_mlp_body(_gnorm(o, z, weight, eps, activation), packed, scales, zeros,
-                                 group_size, None)
+        # Decode / verify rows: the op is opaque to inductor, so the eager forward_static here was a chain of
+        # elementwise launches per GDN layer (+1.4 ms per decode step, measured) where the per-token config runs
+        # one compiled kernel. One Triton launch, same arithmetic order as forward_static.
+        if _TRITON is not None:
+            normed = _TRITON.gnorm(o, z, weight, eps, activation)
+        else:
+            normed = _gnorm(o, z, weight, eps, activation)
+        return _runtime_mlp_body(normed, packed, scales, zeros, group_size, None)
     global _GNORM_COMPILED
     if _TRITON is not None:
         quant_x, x_scale = _TRITON.gnorm_quantize_groups(o, z, weight, eps, activation, _AGROUP)
