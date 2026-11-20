@@ -1,10 +1,11 @@
 """Optional SLM-staged RecoverSSM verify (K8V4_RSSM_VERIFY=slm) and deferred RecoverSSM commit (K8V4_RSSM_DEFER_COMMIT=1)
 for the GDN layers, both under K8V4_GDN_RECOVERSSM=1.
 
-Measured reason (one B70, Qwen3.8-27B GDN shapes, fp16 state, 48 layers; docs/2026-11-20-rssm-verify.md): the
-v0.1.17 verify kernel ran at about 3x its state-read floor (1.58 ms per 4-user step against 0.51) because every
-token of a window waited on its own global loads and q / k norm reductions inside each sub-group's recurrence; and
-the commit after sampling read and wrote every state once more (1.21 ms per 4-user step).
+Measured reason (one B70, Qwen3.8-27B GDN shapes, fp16 state, 48 layers; docs/2026-11-20-rssm-verify.md): at 4 x 63K
+the GDN RecoverSSM path costs about 2.7 ms per decode step (verify 1.5, commit 1.2), and the commit after sampling
+reads and writes every request's state once more after the verify has just read it. Deferring that fold into the next
+verify takes 0.54 ms off verify + commit (2.73 -> 2.19 ms, kernel bench) and 0.5 ms off the served 4-user step
+(54.7 -> 54.2 ms); staging the verify's inputs in SLM takes 6% off the verify kernel (13% at one request).
 
 - K8V4_RSSM_VERIFY=slm: torch.ops._k8v4_rssm.verify_slm (native/rssm/rssm_verify_slm.hpp) stages the window's
   normalised q / k, values, beta and decay in SLM before the recurrence. Bit-identical outputs and replay records.
