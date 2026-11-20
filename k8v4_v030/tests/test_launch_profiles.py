@@ -62,6 +62,25 @@ class LaunchProfileTest(unittest.TestCase):
         self.assertIn('--max-num-seqs=2', args)
         self.assertIn('--max-model-len=133056', args)
 
+    def test_warm_prefix_warmup_is_passed_only_when_set(self):
+        for options in ({}, {'K8V4_TP': '1'}):
+            with self.subTest(options=options):
+                result, args = self.command(**options)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(any(arg.startswith('K8V4_WARMUP_WARM_PREFIX') for arg in args))
+        for value in ('0', '1'):
+            result, args = self.command(K8V4_TP='1', K8V4_WARMUP_WARM_PREFIX=value)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('K8V4_WARMUP_WARM_PREFIX=%s' % value, args)
+        result, args = self.command(K8V4_TP='1', K8V4_WARMUP_WARM_PREFIX='1', K8V4_WARMUP_WARM_PREFIX_CTX='32000')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('K8V4_WARMUP_WARM_PREFIX_CTX=32000', args)
+        for options in ({'K8V4_WARMUP_WARM_PREFIX': '2'}, {'K8V4_WARMUP_WARM_PREFIX': 'yes'},
+                        {'K8V4_WARMUP_WARM_PREFIX_CTX': '0'}, {'K8V4_WARMUP_WARM_PREFIX_CTX': '64k'}):
+            with self.subTest(bad=options):
+                result, args = self.command(K8V4_TP='1', **options)
+                self.assertEqual(result.returncode, 2)
+
     def test_invalid_gpu_selections_are_rejected_before_launch(self):
         for options in ({'K8V4_TP': '4'}, {'K8V4_TP': '1', 'K8V4_DEVICES': '0,1'},
                         {'K8V4_TP': '2', 'K8V4_DEVICES': '0'}, {'K8V4_DEVICES': '1,1'},
