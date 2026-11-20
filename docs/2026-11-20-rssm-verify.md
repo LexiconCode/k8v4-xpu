@@ -111,13 +111,17 @@ tokens, p50 of the inter-chunk gaps = engine step); depth check `v034-depthcheck
 | 2 `rvA2` | (l3h), A's compile cache | 508,996 | 8/9 | 54.8 / 54.6 | 41.2 / 41.1 |
 | 3 `rvA3` | (l3h), image with the slot splice | 508,996 | 8/9 | 54.9 / 54.7 | 41.2 / 41.1 |
 | 3 **`rvB3`** | **`K8V4_RSSM_DEFER_COMMIT=1`** (fixed), A3's compile cache | 501,350 | 8/9 | **54.3 / 54.1** | **41.1 / 41.0** |
+| 4 `rvE` | l3h + 32K draft vocab (= `l3best`) | 513,365 | 8/9 | 54.3 / 54.2 | 40.3 / 40.2 |
+| 4 **`rvD2`** | **l3h + 32K draft vocab + `K8V4_RSSM_DEFER_COMMIT=1`**, E's compile cache | 511,180 | 8/9 | **53.8 / 53.7** | **40.2 / 40.1** |
 
 The deferred commit (which runs the SLM verify) takes **0.5-0.7 ms off the 4-user 63K step** in all three
 same-window pairs (54.7 -> 54.2, 54.8 -> 54.1, 54.9 -> 54.3 p50) and ~0.1-0.2 ms at one user; the SLM verify alone
 is ~0.3 ms of it. Window-to-window drift of the baseline is +-0.1 ms. KV: the doubled replay buffer costs 1,092
 tokens; `rvB3` started with 501,350 (-1.5%; one start, the profiler's peak differed; not investigated further).
 Against ours (prod -27: 54.1 ms at 4 users / 42.8 at one, last-3ms doc): 54.1-54.3 / 41.0-41.1, i.e. a tie at four
-users and 4% faster at one.
+users and 4% faster at one. With the 32K draft vocabulary (`l3best` of the last-3ms doc, which costs some
+acceptance on long outputs) the deferred commit gives **53.8 / 53.7 ms at four users (ours 54.1) and 40.2 / 40.1 at
+one (ours 42.8)**: the first configuration of their stack that is below ours at four users (by 0.3-0.4 ms, ~0.7%).
 
 ### Lossless check
 
@@ -126,7 +130,7 @@ the same 7 texts as `rvA`. Separate compile caches are not: inductor autotunes s
 76 `best_config` files picked differently between `rvA` and `rvB`), which alone changes every text. So arms that are
 compared share a copied cache (`CACHE_FROM`).
 
-- **`rvB3` (deferred commit, fixed) == `rvA3`: all 7 texts identical** (one-user chat, one-user 63K, four concurrent
+- **`rvB3` (deferred commit, fixed) == `rvA3`, and `rvD2` == `rvE`: all 7 texts identical in both pairs** (one-user chat, one-user 63K, four concurrent
   63K users), with the same cache. EXACT 8/9 both.
 - The first deferred-commit image (`rvB2` vs `rvA2`, same cache) was **not**: texts diverged after 8-200 tokens. Cause:
   vLLM 0.34's hybrid model state builds the GDN attention metadata without the request slots (`req_idx`), so replay
