@@ -260,7 +260,7 @@ class Xe2K8V4Impl(AttentionImpl[Xe2K8V4Metadata]):
         # K8V4_KV_ROTATE: store K / V in a Hadamard basis (see k8v4_v030/kv_rotate.py).
         self._rot_k, self._rot_v = kv_rotate.from_env()
         if self._rot_k or self._rot_v:
-            logger.info_once("K8/V4 Hadamard-rotated cache: K %s, V %s", self._rot_k, self._rot_v)
+            kv_rotate.note_once(self._rot_k, self._rot_v)
 
     def do_kv_cache_update(
         self,
