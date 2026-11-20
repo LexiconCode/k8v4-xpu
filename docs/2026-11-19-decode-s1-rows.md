@@ -169,6 +169,35 @@ registers) costs more in occupancy, registers or work on the same chain than it 
 launches (batched requests) and SLM traffic (blocked tiles, P in registers). The remaining distance to the read
 floor at q4 (63K: 256 us per request batched against 167) is spread over all four phases of the page chain.
 
+## Round 3 (2026-11-20): pure-bit dequant, named-barrier ideas, and what bounds the kernel
+
+All measured as before (one op per graph, `bench/ab_s1pages.py`, against `SPLITS=32 FAST=1` in the same
+process; us; correctness against the one-page kernel). None was adopted; the branch keeps FAST + batched requests.
+
+| idea | 63K q1 / q4 / q7 | 128K q1 / q4 / q7 | correctness | verdict |
+|---|---|---|---|---|
+| baseline FAST | 237 / 277 / 418 | 437 / 509 / 805 | 9.8e-4 | |
+| V dequant in packed half2 bit ops (`0x6400 \| n` minus 1024, one half2 fma with scale and -zero x scale, two columns per store) | 271 / 319 / 410 | 506 / 599 / 788 | 3.9e-3 causal (fails the 2e-3 bar) | slower at q1/q4, q7 within noise, less exact |
+| V scale folded into P, raw nibbles as exact halves (round 2) | 264 / 299 / 438 | | 2.0e-3 | slower |
+| smaller SLM tile (P sized to the live rows: 17 / 19 KB) + 128 registers + 48 splits, i.e. 6-7 work-groups per Xe-core instead of 4 | 242 / 281 / - | 452 / 522 / - | 9.8e-4 | no gain; 4 x 63K batched worse (962 / 1185 vs 825 / 1032) |
+| heads of one split as adjacent work-groups (same KV pages read together) | 236 / 276 / 417 | 436 / 509 / 798 | 9.8e-4 | no change |
+| K page staged into SLM with 128-byte lane loads, QK operands from SLM | 416 / 574 / 772 | 811 / 1108 / 1490 | 9.8e-4 | much slower |
+| softmax on the QK accumulators of all 8 sub-groups (no S round trip; rows agree on a new max through an SLM atomic only when it moves) | 264 / 314 / 481 | 493 / 598 / 929 | wrong (1.9) | slower even before fixing the bug; dropped |
+
+Named barriers (sycl-tla #812: `nbarrier.signal` / `nbarrier.wait` inline asm plus `named_barrier_init`) were
+not built. Every phase of the page chain is all-to-all across the sub-groups (scores of a row come from four
+sub-groups, P of all rows feeds every PV column slab), so a named barrier only pays off with a producer /
+consumer split that stages the next page through SLM. Each measurement above points the other way: staging
+through SLM (K tile: +75%, second V buffer: +52%), fewer computing sub-groups (accumulator softmax on T
+sub-groups: +40%) and cheaper ALU work (bit-op dequant: no gain) all lose, while more work-groups per Xe-core
+(6-7 instead of 4) gain nothing. The kernel is bound by its SLM round trips per page (S, P x 8 sub-groups, V
+tile), not by DRAM, ALU or occupancy; reducing those further needs a different decomposition of the work (for
+example several KV heads or both V halves per work-group with P kept in registers), which these experiments
+could not reach without spilling.
+
+Libraries and scripts: `build/libxe2_kv_{h2,ss,hi,ks,sa}.so` (untracked), `/root/rice/results/s1rows-r13.txt`
+... `s1rows-r16.txt`.
+
 ## Correctness
 
 Same process, identical data, against the one-page PR3 kernel with fp32 partials (eager, graph replay, causal
