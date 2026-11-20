@@ -204,6 +204,11 @@ class GDNRecoverSSMMetadataBuilder(GDNAttentionMetadataBuilder):
             fast_build=fast_build,
         )
         if self._defer:
+            if m.req_idx is None and meta.num_spec_decodes > 0 and not self._capturing:
+                raise ValueError(
+                    "K8V4_RSSM_DEFER_COMMIT=1 needs the request slots in the attention metadata "
+                    "(tools/patch_rssm_defer_v030.py)"
+                )
             self._clear_prefill_slots(m, rows)
         base = {f.name: getattr(meta, f.name) for f in fields(meta)}
         commit = None

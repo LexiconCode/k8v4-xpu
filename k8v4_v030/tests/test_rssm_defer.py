@@ -3,7 +3,9 @@ bound, replay rows. XPU (skipped without a device and the built library, K8V4_RS
 the stock verify, and the deferred commit to commit-then-verify over several steps, plain and align mode."""
 from __future__ import annotations
 
+import importlib.util
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -51,6 +53,47 @@ class KnobTest(unittest.TestCase):
                 rssm_defer.check_window(7)
                 with self.assertRaises(ValueError):
                     rssm_defer.check_window(8)
+
+
+_spec = importlib.util.spec_from_file_location('patch_rssm_defer_v030', ROOT / 'tools/patch_rssm_defer_v030.py')
+patch = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(patch)
+
+
+class PatchTest(unittest.TestCase):
+    SOURCE = ('def prepare_attn(self, input_batch, for_capture):\n'
+              '        attn_metadata = build_attn_metadata(\n' + patch._CALL_OLD + '        return attn_metadata\n')
+
+    def test_splices_once_and_stays_inert_without_the_knob(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / patch.HYBRID
+            path.parent.mkdir(parents=True)
+            path.write_text(self.SOURCE, encoding='utf-8')
+            self.assertTrue(patch.patch_vllm_tree(Path(temp))[0].endswith(':patched'))
+            text = path.read_text(encoding='utf-8')
+            self.assertTrue(patch.patch_vllm_tree(Path(temp))[0].endswith(':unchanged'))
+            self.assertEqual(text, path.read_text(encoding='utf-8'))
+            self.assertEqual(text.count('req_idx=_k8v4_rssm_req_idx(input_batch)'), 1)
+            scope = {}
+            exec(compile('def _k8v4_rssm_req_idx' + text.split('def _k8v4_rssm_req_idx', 1)[1], 'hybrid', 'exec'),
+                 scope)
+
+            class Batch:
+                idx_mapping_np = [3, 1]
+
+            with mock.patch.dict(os.environ, {rssm_defer.DEFER_ENV: ''}):
+                self.assertIsNone(scope['_k8v4_rssm_req_idx'](Batch()))
+            with mock.patch.dict(os.environ, {rssm_defer.DEFER_ENV: '1'}):
+                self.assertEqual(scope['_k8v4_rssm_req_idx'](Batch()), [3, 1])
+
+    def test_refuses_unknown_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / patch.HYBRID
+            path.parent.mkdir(parents=True)
+            path.write_text('def prepare_attn():\n    pass\n', encoding='utf-8')
+            with self.assertRaises(RuntimeError):
+                patch.patch_vllm_tree(Path(temp))
+            self.assertEqual(path.read_text(encoding='utf-8'), 'def prepare_attn():\n    pass\n')
 
 
 def _xpu():
