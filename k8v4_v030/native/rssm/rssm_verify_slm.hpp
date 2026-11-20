@@ -364,8 +364,10 @@ void launch_verify_slm(sycl::queue& queue, torch::Tensor& core_attn_out, const t
   });
 }
 
-// Same contract as gdn::gated_delta_rule_recoverssm (+ record_indices); windows of at most 8 tokens (the replay
-// buffer's position count bounds every window). pending / parity given: the deferred commit (see above).
+// Same contract as gdn::gated_delta_rule_recoverssm (+ record_indices); windows of at most 16 tokens (the replay
+// buffer's position count bounds every window). The SLM layout is sized by that count: buffers of up to 8
+// positions (MTP depth <= 7) launch the max_t = 8 kernel exactly as before; 9-16 (deep copy drafting, depth 15)
+// launch max_t = 16, the same code with a larger staging area (29 KB of SLM with the deferred commit). pending / parity given: the deferred commit (see above).
 inline void verify_slm(sycl::queue& queue, torch::Tensor& core_attn_out, const torch::Tensor& q,
                        const torch::Tensor& k, const torch::Tensor& v, const torch::Tensor& b,
                        const torch::Tensor& a, const torch::Tensor& A_log, const torch::Tensor& dt_bias,
@@ -379,7 +381,8 @@ inline void verify_slm(sycl::queue& queue, torch::Tensor& core_attn_out, const t
   const int num_v_heads = v.size(1);
   TORCH_CHECK(num_v_heads % num_k_heads == 0);
   TORCH_CHECK(head_k_dim == 4 * sub_group_size, "verify_slm is built for head_k_dim ", 4 * sub_group_size);
-  TORCH_CHECK(replay_state.size(2) <= 8, "verify_slm takes windows of at most 8 tokens");
+  TORCH_CHECK(replay_state.size(2) <= 16, "verify_slm takes windows of at most 16 tokens");
+  const bool wide = replay_state.size(2) > 8;
   const bool defer = pending.has_value();
   TORCH_CHECK(defer == parity.has_value(), "the deferred commit needs both pending and parity");
   int64_t slot_rows = 0;
@@ -393,18 +396,25 @@ inline void verify_slm(sycl::queue& queue, torch::Tensor& core_attn_out, const t
   }
   const int* pend = defer ? reinterpret_cast<const int*>(pending->data_ptr()) : nullptr;
   const int* par = defer ? reinterpret_cast<const int*>(parity->data_ptr()) : nullptr;
-#define K8V4_SLM_LAUNCH(scalar_t, state_t)                                                                       \
+#define K8V4_SLM_LAUNCH_T(scalar_t, state_t, max_t)                                                              \
   do {                                                                                                          \
     if (defer)                                                                                                  \
-      launch_verify_slm<scalar_t, state_t, 4, 8, true>(queue, core_attn_out, q, k, v, b, a, A_log, dt_bias,       \
-                                                       ssm_state, replay_state, query_start_loc, token_indx,       \
-                                                       state_indices, record_indices, null_block_id, pend, par,    \
-                                                       slot_rows);                                                \
+      launch_verify_slm<scalar_t, state_t, 4, max_t, true>(queue, core_attn_out, q, k, v, b, a, A_log, dt_bias,   \
+                                                           ssm_state, replay_state, query_start_loc, token_indx,   \
+                                                           state_indices, record_indices, null_block_id, pend,     \
+                                                           par, slot_rows);                                       \
     else                                                                                                        \
-      launch_verify_slm<scalar_t, state_t, 4, 8, false>(queue, core_attn_out, q, k, v, b, a, A_log, dt_bias,      \
-                                                        ssm_state, replay_state, query_start_loc, token_indx,      \
-                                                        state_indices, record_indices, null_block_id, nullptr,     \
-                                                        nullptr, 0);                                              \
+      launch_verify_slm<scalar_t, state_t, 4, max_t, false>(queue, core_attn_out, q, k, v, b, a, A_log, dt_bias,  \
+                                                            ssm_state, replay_state, query_start_loc, token_indx,  \
+                                                            state_indices, record_indices, null_block_id, nullptr, \
+                                                            nullptr, 0);                                          \
+  } while (0)
+#define K8V4_SLM_LAUNCH(scalar_t, state_t)                                                                       \
+  do {                                                                                                          \
+    if (wide)                                                                                                   \
+      K8V4_SLM_LAUNCH_T(scalar_t, state_t, 16);                                                                 \
+    else                                                                                                        \
+      K8V4_SLM_LAUNCH_T(scalar_t, state_t, 8);                                                                  \
   } while (0)
 #define K8V4_SLM_STATE(scalar_t)                                                                                 \
   do {                                                                                                          \
@@ -427,6 +437,7 @@ inline void verify_slm(sycl::queue& queue, torch::Tensor& core_attn_out, const t
   }
 #undef K8V4_SLM_STATE
 #undef K8V4_SLM_LAUNCH
+#undef K8V4_SLM_LAUNCH_T
 }
 
 }  // namespace k8v4_rssm

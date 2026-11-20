@@ -34,7 +34,7 @@ def verify(out, q, k, v, b, a, a_log, dt_bias, ssm, rep, loc, tok, si, slots, de
                                              defer.pending, defer.parity)
 
 
-def run_case(name, sdt, act, align, steps=7, seed=0):
+def run_case(name, sdt, act, align, steps=7, seed=0, W=W, B=8):
     gen = torch.Generator(device='cpu').manual_seed(seed)
 
     def rnd(*shape, scale=1.0, dtype=act):
@@ -42,7 +42,6 @@ def run_case(name, sdt, act, align, steps=7, seed=0):
 
     reqs = 3
     slots = torch.tensor([2, 0, 3], dtype=torch.int32, device=dev)
-    B = 8
     width = 12
     nblk = 1 + reqs * width
     bt = torch.arange(1, nblk, dtype=torch.int32).view(reqs, width).to(dev)
@@ -120,6 +119,12 @@ for sdt in (torch.float16, torch.bfloat16, torch.float32):
             seed += 1
             ok &= run_case('%s state %s act %s' % (str(sdt).split('.')[-1], str(act).split('.')[-1],
                                                     'align' if align else 'plain'), sdt, act, align, seed=seed)
+# deep copy drafting: windows of up to 16 tokens (the max_t = 16 kernel), align blocks of 32
+for sdt in (torch.float16, torch.float32):
+    for align in (False, True):
+        seed += 1
+        ok &= run_case('w16 %s state %s' % (str(sdt).split('.')[-1], 'align' if align else 'plain'), sdt,
+                       torch.float16, align, seed=seed, W=16, B=32)
 print('DEFER CHECK ALL bit-identical %s' % ok, flush=True)
 
 

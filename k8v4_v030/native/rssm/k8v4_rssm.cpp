@@ -39,7 +39,7 @@ static void check_common(const torch::Tensor& core_attn_out, const torch::Tensor
 }
 
 // verify with the window's inputs staged in SLM first (K8V4_RSSM_VERIFY=slm; rssm_verify_slm.hpp): same contract,
-// same bits, windows of at most 8 tokens.
+// same bits, windows of at most 16 tokens.
 void verify_slm(torch::Tensor& core_attn_out, const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
                 const torch::Tensor& b, const torch::Tensor& a, const torch::Tensor& A_log, const torch::Tensor& dt_bias,
                 const torch::Tensor& ssm_state, torch::Tensor& replay_state, const torch::Tensor& query_start_loc,

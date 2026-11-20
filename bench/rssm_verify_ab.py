@@ -116,6 +116,8 @@ for act in (torch.float16, torch.bfloat16):
     ok &= check('ragged %s s16 remap' % a, [4, 1, 3, 2], act, torch.float16, remap=True)
     ok &= check('null row %s s32' % a, [4, 4, 4], act, torch.float32, null_rows=(1,))
     ok &= check('8 tok %s s16 no rec' % a, [8, 5], act, torch.float16, rec_rows=False)
+    ok &= check('16 tok %s s16 deep' % a, [16, 9, 1, 16], act, torch.float16)
+    ok &= check('16 tok %s s32 no rec' % a, [16, 12], act, torch.float32, rec_rows=False)
 print('CHECK ALL bit-identical %s' % ok, flush=True)
 CHECK_ONLY = os.environ.get('K8V4_RSSM_CHECK_ONLY') == '1'
 for act in () if CHECK_ONLY else (torch.float16, torch.bfloat16):
