@@ -447,6 +447,11 @@ if [ -n "${K8V4_CHAT_TEMPLATE_FIX:-}" ]; then
   fi
 fi
 
+# Optional Hadamard-rotated K / V cache contents (k8v4_v030/kv_rotate.py). Unset keeps the command unchanged.
+if [ -n "${K8V4_KV_ROTATE:-}" ]; then
+  [[ "$K8V4_KV_ROTATE" =~ ^(k|v|kv)$ ]] || { echo "K8V4_KV_ROTATE must be k, v or kv" >&2; exit 2; }
+  extra+=(-e "K8V4_KV_ROTATE=${K8V4_KV_ROTATE}")
+fi
 docker_cmd=(docker run -d --name "$NAME" --restart=no \
   --device /dev/dri --group-add "$render_gid" --ipc=host --shm-size=8g \
   -p "${BIND_HOST}:${PORT}:8000" \

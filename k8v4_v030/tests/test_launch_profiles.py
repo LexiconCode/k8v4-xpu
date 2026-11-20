@@ -487,6 +487,20 @@ class LaunchProfileTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertEqual(args, [])
 
+    def test_kv_rotate_is_passed_only_when_set(self):
+        result, default = self.command(K8V4_TP='1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any('K8V4_KV_ROTATE' in arg for arg in default))
+        result, args = self.command(K8V4_TP='1', K8V4_KV_ROTATE='v')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        i = args.index('K8V4_KV_ROTATE=v')
+        self.assertEqual(args[i - 1], '-e')
+        own = lambda argv: [a for a in argv if not a.startswith(tempfile.gettempdir())]  # per-call temp mounts
+        self.assertEqual(own(args[:i - 1] + args[i + 1:]), own(default))
+        result, _ = self.command(K8V4_TP='1', K8V4_KV_ROTATE='hadamard')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b'K8V4_KV_ROTATE must be', result.stderr)
+
     def test_agent_api_knobs_are_absent_by_default(self):
         result, args = self.command(K8V4_TP='1')
         self.assertEqual(result.returncode, 0, result.stderr)

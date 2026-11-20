@@ -32,6 +32,7 @@ from k8v4_v030.onednn_prefill import head_major_prefill, prefill_mode
 from k8v4_v030.stage_profile import profile_enabled, profile_range
 from k8v4_v030.layout import CACHE_DTYPE, DECODE_MAX_T, PAGE, SLOT_BYTES_PER_HEAD, PageLayout
 from k8v4_v030.ops_api import ops
+from k8v4_v030 import kv_rotate
 from k8v4_v030.plan import (
     layout_for_heads,
     query_segments,
@@ -256,6 +257,10 @@ class Xe2K8V4Impl(AttentionImpl[Xe2K8V4Metadata]):
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
         # K8V4_DRAFT_LASTROW: decided on the first forward, from the layer name.
         self._draft_lastrow: bool | None = None
+        # K8V4_KV_ROTATE: store K / V in a Hadamard basis (see k8v4_v030/kv_rotate.py).
+        self._rot_k, self._rot_v = kv_rotate.from_env()
+        if self._rot_k or self._rot_v:
+            logger.info_once("K8/V4 Hadamard-rotated cache: K %s, V %s", self._rot_k, self._rot_v)
 
     def do_kv_cache_update(
         self,
@@ -281,6 +286,10 @@ class Xe2K8V4Impl(AttentionImpl[Xe2K8V4Metadata]):
             )
         if key.shape[0] < ntok or value.shape[0] < ntok:
             raise RuntimeError("key/value shorter than slot_mapping")
+        if self._rot_k:
+            key = kv_rotate.rotate(key.narrow(0, 0, ntok), torch.float16)
+        if self._rot_v:
+            value = kv_rotate.rotate(value.narrow(0, 0, ntok), torch.float16)
         if profile_enabled():
             with profile_range("kv_store", "kv_store_paged"):
                 _store_kv(key, value, cache, slot_mapping, ntok, self.layout)
@@ -324,12 +333,17 @@ class Xe2K8V4Impl(AttentionImpl[Xe2K8V4Metadata]):
                     self.layout.hq,
                 )
             )
+        if self._rot_k:
+            query = kv_rotate.rotate(query)
         if attn_metadata.packed_q_len:
             self._packed(query, cache, attn_metadata, output)
-            return output
-        if _capturing():
-            raise RuntimeError("K8/V4 prefill cannot run inside an XPU graph")
-        self._eager(query, cache, attn_metadata, output)
+        else:
+            if _capturing():
+                raise RuntimeError("K8/V4 prefill cannot run inside an XPU graph")
+            self._eager(query, cache, attn_metadata, output)
+        if self._rot_v:
+            # V was stored as V H; P (V H) H = P V (H symmetric, H H = I).
+            output.copy_(kv_rotate.rotate(output))
         return output
 
     def _packed(
