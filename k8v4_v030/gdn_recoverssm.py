@@ -125,30 +125,42 @@ def _verify(layer, md, out, z, qkvz, ba, conv_weights, sp_loc, sp_idx, sp_state,
     import torch
 
     _load_lib()
+    if not _verify_op:
+        from k8v4_v030 import rssm_defer
+
+        _verify_op.append((rssm_defer.verify_mode(), rssm_defer.defer_enabled()))
+    mode, deferred = _verify_op[0]
+    if mode == 'stock' and not deferred:
+        col_w, col0 = sp_state[:, :1].expand(-1, layer.num_spec + 1).contiguous(), None
+    else:
+        # The checkpoint columns are the same for every GDN layer of a step: copy them once per step (metadata
+        # object), not twice per layer.
+        key = (sp_state.data_ptr(), tuple(sp_state.shape), n_spec, layer.num_spec)
+        cols = getattr(md, '_k8v4_rssm_cols', None)
+        if cols is None or cols[0] != key:
+            cols = (key, sp_state[:, :1].expand(-1, layer.num_spec + 1).contiguous(),
+                    sp_state[:n_spec, 0].contiguous())
+            md._k8v4_rssm_cols = cols
+        col_w, col0 = cols[1], cols[2]
     q, k, v, b, a = torch.ops._xpu_C.causal_conv1d_spec(
         z, qkvz, ba, layer.num_k_heads, layer.num_v_heads, layer.head_k_dim, layer.head_v_dim,
         layer.kv_cache[0], conv_weights, layer.conv1d.bias, layer.activation, 0, 0, n_spec,
         sp_loc.contiguous(), sp_idx.contiguous(),
         # one checkpoint column; the conv kernel reads the window width from the column count
-        sp_state[:, :1].expand(-1, layer.num_spec + 1).contiguous(),
+        col_w,
         md.num_accepted_tokens.contiguous(), n_tok, layer.tp_size, not layer.gqa_interleaved_layout)
     rec = md.recoverssm_record_indices
-    if not _verify_op:
-        from k8v4_v030 import rssm_defer
-
-        _verify_op.append(('verify_slm' if rssm_defer.verify_mode() == 'slm' else 'verify', rssm_defer.defer_enabled()))
-    op, deferred = _verify_op[0]
+    op = 'verify_slm' if mode == 'slm' else 'verify'
     if deferred:
         # K8V4_RSSM_DEFER_COMMIT: fold the slot's pending accepted records first (rssm_defer.py)
         d = md.recoverssm_context.k8v4_defer
         torch.ops._k8v4_rssm.verify_deferred(
             out, q, k, v, b, a, layer.A_log, layer.dt_bias, layer.kv_cache[1], layer.recoverssm_replay,
-            sp_loc[: n_spec + 1].contiguous(), sp_idx, sp_state[:n_spec, 0].contiguous(), rec[:n_spec].contiguous(), 0,
-            d.pending, d.parity)
+            sp_loc[: n_spec + 1].contiguous(), sp_idx, col0, rec[:n_spec].contiguous(), 0, d.pending, d.parity)
         return
     getattr(torch.ops._k8v4_rssm, op)(
         out, q, k, v, b, a, layer.A_log, layer.dt_bias, layer.kv_cache[1], layer.recoverssm_replay,
-        sp_loc[: n_spec + 1].contiguous(), sp_idx, sp_state[:n_spec, 0].contiguous(),
+        sp_loc[: n_spec + 1].contiguous(), sp_idx, sp_state[:n_spec, 0].contiguous() if col0 is None else col0,
         None if rec is None else rec[:n_spec].contiguous(), 0)
 
 

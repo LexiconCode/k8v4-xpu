@@ -45,7 +45,7 @@ def defer_enabled() -> bool:
 
 def check_window(num_spec: int) -> None:
     """The SLM kernel and the deferred commit take windows of at most MAX_WINDOW tokens."""
-    if (verify_mode() == 'slm' or defer_enabled()) and num_spec + 1 > MAX_WINDOW:
+    if (verify_mode() != 'stock' or defer_enabled()) and num_spec + 1 > MAX_WINDOW:
         raise ValueError('%s / %s take at most %d speculative tokens per window, got %d'
                          % (VERIFY_ENV, DEFER_ENV, MAX_WINDOW - 1, num_spec))
 
