@@ -11,6 +11,7 @@ import os
 import sys
 
 import torch
+import vllm_xpu_kernels._xpu_C  # noqa: F401  (first, as in vLLM: its stock RecoverSSM kernel shares the SYCL kernel name)
 
 from k8v4_v030 import rssm_defer
 from k8v4_v030.rssm_gdn import GDNRecoverSSMCommitContext
@@ -22,6 +23,15 @@ LAYERS = 2
 SLOTS = 4
 W = 4  # spec_query_len
 CONV_DIM = 64
+
+
+def verify(out, q, k, v, b, a, a_log, dt_bias, ssm, rep, loc, tok, si, slots, defer=None):
+    """Reference: the stock verify; deferred: verify_deferred."""
+    if defer is None:
+        torch.ops._k8v4_rssm.verify(out, q, k, v, b, a, a_log, dt_bias, ssm, rep, loc, tok, si, slots, 0)
+    else:
+        torch.ops._k8v4_rssm.verify_deferred(out, q, k, v, b, a, a_log, dt_bias, ssm, rep, loc, tok, si, slots, 0,
+                                             defer.pending, defer.parity)
 
 
 def run_case(name, sdt, act, align, steps=7, seed=0):
@@ -57,15 +67,15 @@ def run_case(name, sdt, act, align, steps=7, seed=0):
         loc = torch.tensor([0] + list(torch.tensor(lens).cumsum(0).tolist()), dtype=torch.int32, device=dev)
         q, k = rnd(T, HK, DK), rnd(T, HK, DK)
         v, b, a = rnd(T, HV, DV), rnd(T, HV), rnd(T, HV)
+        tok = torch.arange(T, dtype=torch.int32, device=dev)
         si = torch.tensor([si_of(r) for r in range(reqs)], dtype=torch.int32, device=dev)
         outs_r, outs_d = [], []
         for li in range(LAYERS):
             o_r = torch.empty(T, HV, DV, dtype=act, device=dev)
             o_d = torch.empty_like(o_r)
-            torch.ops._k8v4_rssm.verify(o_r, q, k, v, b, a, a_log, dt_bias, ssm_r[li], rep_r[li], loc, None, si,
-                                        slots, 0)
-            torch.ops._k8v4_rssm.verify_deferred(o_d, q, k, v, b, a, a_log, dt_bias, ssm_d[li], rep_d[li], loc, None,
-                                                 si, slots, 0, ctx_d.k8v4_defer.pending, ctx_d.k8v4_defer.parity)
+            verify(o_r, q, k, v, b, a, a_log, dt_bias, ssm_r[li], rep_r[li], loc, tok, si, slots)
+            verify(o_d, q, k, v, b, a, a_log, dt_bias, ssm_d[li], rep_d[li], loc, tok, si, slots,
+                   ctx_d.k8v4_defer)
             outs_r.append(o_r)
             outs_d.append(o_d)
         same = all(torch.equal(x, y) for x, y in zip(outs_r, outs_d))
@@ -109,9 +119,26 @@ for sdt in (torch.float16, torch.bfloat16, torch.float32):
         for align in (False, True):
             seed += 1
             ok &= run_case('%s state %s act %s' % (str(sdt).split('.')[-1], str(act).split('.')[-1],
-                                                    'align' if align else 'plain'), sdt, act, align,
-                           seed=seed)
+                                                    'align' if align else 'plain'), sdt, act, align, seed=seed)
 print('DEFER CHECK ALL bit-identical %s' % ok, flush=True)
+
+
+MODES = ['stock', 'slm', 'defer']
+
+
+def launch_floor():
+    """48 back-to-back launches of a trivial kernel: the per-step launch cost every verify timing above includes."""
+    x = torch.zeros(16, device=dev)
+    for _ in range(5):
+        x.add_(1)
+    torch.xpu.synchronize()
+    s, e = torch.xpu.Event(enable_timing=True), torch.xpu.Event(enable_timing=True)
+    s.record()
+    for _ in range(30 * 48):
+        x.add_(1)
+    e.record()
+    torch.xpu.synchronize()
+    print('LAUNCH 48 trivial kernels: %.3f ms per step' % (s.elapsed_time(e) / 30), flush=True)
 
 
 def bench_step(reqs, drafts, acc_n, act):
@@ -126,19 +153,21 @@ def bench_step(reqs, drafts, acc_n, act):
     q, k, v, b, a = rnd(T, HK, DK), rnd(T, HK, DK), rnd(T, HV, DV), rnd(T, HV), rnd(T, HV)
     a_log, dt_bias = rnd(HV, dtype=torch.float32), rnd(HV, scale=0.5)
     loc = torch.arange(0, T + 1, Wn, dtype=torch.int32, device=dev)
+    tok = torch.arange(T, dtype=torch.int32, device=dev)
     si = torch.arange(1, reqs + 1, dtype=torch.int32, device=dev)
     slots = torch.arange(reqs, dtype=torch.int32, device=dev)
     acc = torch.full((reqs,), acc_n, dtype=torch.int32, device=dev)
     res = {}
-    for mode in ('stock', 'slm', 'defer'):
-        rows = 2 * reqs if mode == 'defer' else reqs
+    for mode in MODES:
+        deferred = mode.endswith('defer')
+        rows = 2 * reqs if deferred else reqs
         groups = []
         for g in range(3):
             ssm = [(torch.randn(nblk, HV, DV, DK, generator=gen) * 0.1).to(torch.float16).to(dev) for _ in range(16)]
             conv = [torch.zeros(nblk, conv_dim, 3 + Wn - 1, dtype=act, device=dev) for _ in range(16)]
             rep = [torch.zeros(rows, HV, Wn, DV + DK + 1, dtype=torch.float32, device=dev) for _ in range(16)]
             ctx = GDNRecoverSSMCommitContext.from_tensors(conv, ssm, rep, spec_query_len=Wn, max_num_reqs=reqs)
-            if mode == 'defer':
+            if deferred:
                 rssm_defer.attach(ctx, reqs)
             groups.append((ssm, rep, ctx))
         outs = [torch.empty(T, HV, DV, dtype=act, device=dev) for _ in range(48)]
@@ -148,17 +177,17 @@ def bench_step(reqs, drafts, acc_n, act):
                 for li in range(16):
                     o = outs[g * 16 + li]
                     if mode == 'stock':
-                        torch.ops._k8v4_rssm.verify(o, q, k, v, b, a, a_log, dt_bias, ssm[li], rep[li], loc, None, si,
+                        torch.ops._k8v4_rssm.verify(o, q, k, v, b, a, a_log, dt_bias, ssm[li], rep[li], loc, tok, si,
                                                     slots, 0)
                     elif mode == 'slm':
-                        torch.ops._k8v4_rssm.verify_slm(o, q, k, v, b, a, a_log, dt_bias, ssm[li], rep[li], loc, None,
+                        torch.ops._k8v4_rssm.verify_slm(o, q, k, v, b, a, a_log, dt_bias, ssm[li], rep[li], loc, tok,
                                                         si, slots, 0)
-                    else:
+                    elif mode == 'defer':
                         torch.ops._k8v4_rssm.verify_deferred(o, q, k, v, b, a, a_log, dt_bias, ssm[li], rep[li], loc,
-                                                             None, si, slots, 0, ctx.k8v4_defer.pending,
+                                                             tok, si, slots, 0, ctx.k8v4_defer.pending,
                                                              ctx.k8v4_defer.parity)
             for ssm, rep, ctx in groups:
-                if mode == 'defer':
+                if deferred:
                     rssm_defer.commit(ctx, acc, si, loc, record_indices=slots)
                 else:
                     ctx.commit(acc, si, loc, record_indices=slots)
@@ -180,6 +209,8 @@ def bench_step(reqs, drafts, acc_n, act):
           + ', '.join('%s %.3f ms' % kv for kv in res.items()), flush=True)
 
 
+if os.environ.get('K8V4_RSSM_CHECK_ONLY') != '1':
+    launch_floor()
 for act in () if os.environ.get('K8V4_RSSM_CHECK_ONLY') == '1' else (torch.float16, torch.bfloat16):
     for reqs, drafts, acc_n in ((4, 3, 2), (1, 6, 3), (4, 3, 4), (2, 3, 2)):
         bench_step(reqs, drafts, acc_n, act)

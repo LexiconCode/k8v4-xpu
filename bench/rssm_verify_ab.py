@@ -10,6 +10,7 @@ import os
 import sys
 
 import torch
+import vllm_xpu_kernels._xpu_C  # noqa: F401  (loaded first, as in vLLM)
 
 lib, ops = sys.argv[1], sys.argv[2:]
 torch.ops.load_library(lib)
@@ -100,10 +101,10 @@ def check(name, lens, act, sdt, **kw):
         run(op, d, ssm, rep, out)
         torch.xpu.synchronize()
         same = torch.equal(out, ref_out) and torch.equal(rep, ref_rep) and torch.equal(s0, ssm)
+        dmax = (out.float() - ref_out.float()).abs().max().item()
         ok_all &= same
-        print('CHECK %-28s %-10s out max|d| %.3e  replay max|d| %.3e  bit-identical %s'
-              % (name, op, (out.float() - ref_out.float()).abs().max().item(), (rep - ref_rep).abs().max().item(),
-                 same), flush=True)
+        print('CHECK %-28s %-14s out max|d| %.3e  replay max|d| %.3e  bit-identical %s'
+              % (name, op, dmax, (rep - ref_rep).abs().max().item(), same), flush=True)
     return ok_all
 
 
