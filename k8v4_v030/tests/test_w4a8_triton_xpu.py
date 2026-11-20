@@ -64,6 +64,19 @@ class TritonQuantTest(unittest.TestCase):
                 ulp = ref.float().abs().clamp(min=1e-3) * (2.0 ** -10 if dtype == torch.float16 else 2.0 ** -7)
                 self.assertTrue(bool(((y.float() - ref.float()).abs() <= ulp).all()))
 
+    def test_silu_mul_decode_rows(self):
+        """K8V4_W4A8_FUSED=silu's decode side: SiLU(gate) * up rounded once (the compiled stock SiluAndMul)."""
+        from k8v4_v030 import w4a8_triton as tr
+
+        for dtype in (torch.float16, torch.bfloat16):
+            for rows in (1, 16, 128):
+                gu = (torch.randn(rows, 2 * 17408, device="xpu") * 3).to(dtype)
+                g, u = gu[:, :17408].float(), gu[:, 17408:].float()
+                ref = (g * torch.sigmoid(g) * u).to(dtype)
+                y = tr.silu_mul(gu)
+                ulp = ref.float().abs().clamp(min=1e-3) * (2.0 ** -10 if dtype == torch.float16 else 2.0 ** -7)
+                self.assertTrue(bool(((y.float() - ref.float()).abs() <= ulp).all()))
+
     def test_addnorm(self):
         from k8v4_v030 import w4a8_triton as tr
 

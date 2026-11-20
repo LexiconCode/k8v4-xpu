@@ -447,7 +447,10 @@ def _silu_and_mul(gate_up: torch.Tensor) -> torch.Tensor:
 def _silu_body(gate_up, packed, scales, zeros, group_size):
     flat = gate_up.reshape(-1, gate_up.shape[-1])
     if not (_RUNTIME_ENABLED and _AGROUP and flat.shape[0] > SMALL_M_MAX):
-        return _runtime_mlp_body(_silu_and_mul(flat), packed, scales, zeros, group_size, None)
+        # Decode / verify rows: the compiled stock SiluAndMul rounds SiLU(gate) * up once; _C.silu_and_mul rounds
+        # SiLU(gate) first and differed from it in most elements (measured), so the Triton path rounds once too.
+        act = _TRITON.silu_mul(flat) if _TRITON is not None else _silu_and_mul(flat)
+        return _runtime_mlp_body(act, packed, scales, zeros, group_size, None)
     global _SILU_COMPILED
     if _TRITON is not None:
         quant_x, x_scale = _TRITON.silu_quantize_groups(flat, _AGROUP)
