@@ -116,7 +116,7 @@ fi
 # K8V4_RSSM_VERIFY=slm stages each window's inputs in SLM (bit-identical, -6% verify); K8V4_RSSM_DEFER_COMMIT=1
 # folds a step's accepted records in the next step's verify instead of a separate commit pass over the states
 # (bit-identical; -0.5 ms per 4-user 63K step). Both need K8V4_GDN_RECOVERSSM=1 and a libk8v4_rssm.so built from
-# this tree; windows of at most 8 tokens. Off unless set.
+# this tree; windows of at most 16 tokens (deep drafting at depth 15 fits). Off unless set.
 if [ -n "${K8V4_RSSM_VERIFY:-}" ]; then
   [[ "$K8V4_RSSM_VERIFY" =~ ^(stock|slm)$ ]] || { echo "K8V4_RSSM_VERIFY must be stock or slm" >&2; exit 2; }
   [ "${K8V4_GDN_RECOVERSSM:-}" = 1 ] || { echo "K8V4_RSSM_VERIFY needs K8V4_GDN_RECOVERSSM=1" >&2; exit 2; }
