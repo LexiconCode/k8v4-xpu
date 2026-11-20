@@ -171,6 +171,25 @@ class LaunchProfileTest(unittest.TestCase):
             with self.subTest(bad=bad):
                 result, args = self.command(K8V4_TP='1', K8V4_DRAFT_SKIP_SHARED=bad)
                 self.assertEqual(result.returncode, 2)
+    def test_warm_prefix_warmup_is_passed_only_when_set(self):
+        for options in ({}, {'K8V4_TP': '1'}):
+            with self.subTest(options=options):
+                result, args = self.command(**options)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(any(arg.startswith('K8V4_WARMUP_WARM_PREFIX') for arg in args))
+        for value in ('0', '1'):
+            result, args = self.command(K8V4_TP='1', K8V4_WARMUP_WARM_PREFIX=value)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('K8V4_WARMUP_WARM_PREFIX=%s' % value, args)
+        result, args = self.command(K8V4_TP='1', K8V4_WARMUP_WARM_PREFIX='1', K8V4_WARMUP_WARM_PREFIX_CTX='32000')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('K8V4_WARMUP_WARM_PREFIX_CTX=32000', args)
+        for options in ({'K8V4_WARMUP_WARM_PREFIX': '2'}, {'K8V4_WARMUP_WARM_PREFIX': 'yes'},
+                        {'K8V4_WARMUP_WARM_PREFIX_CTX': '0'}, {'K8V4_WARMUP_WARM_PREFIX_CTX': '64k'}):
+            with self.subTest(bad=options):
+                result, args = self.command(K8V4_TP='1', **options)
+                self.assertEqual(result.returncode, 2)
+
     def test_gdn_heads_mount_is_opt_in(self):
         lib_target = '/opt/venv/lib/python3.12/site-packages/vllm_xpu_kernels/libgdn_attn_kernels_xe_2.so'
         def norm(args):  # each call gets its own temporary model and cache directories
