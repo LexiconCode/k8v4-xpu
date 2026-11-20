@@ -145,6 +145,98 @@ Prefix check (`prefix_check.py`, cache hit vs cold, 10 prompts):
 - F trades its four-user step for deep copy drafting. The copy workloads are not in this scorecard (see
   docs/2026-11-19-deep-all.md: all-copying 4 x 8K +93%, 4 x 63K +58% over the same base).
 
+## Fixes after the scorecard (2026-11-20 evening, tier-2 runs)
+
+Each tier-2 run (`/root/k8v4work/harness/tier2.sh`, or `/root/k8v4work/fixfinal/t2x.sh` = the same plus an lpcheck
+save) is one server start of config F with vision on: EXACT, 4 cold 63K prefills, then 3 rounds x 512 tokens of
+the step timer at 4 users and at 1 user on the warm prefixes. Results are in `/root/rice/results/t2-<label>.txt`.
+Every run is a single start, so step p50 noise is about ±0.2 ms.
+
+### 1. Grouped W4A8 scales no longer cost decode time
+
+The bisect runs `t2-F-v1` (g64, `FUSED=silu,gnorm,addnorm`) and `t2-F-pt` (per-token scales, `FUSED=addnorm`) put
+g64 at about +1.4 ms per step at both batch sizes. W4A8 itself only applies to rows > `SMALL_M_MAX`, but the
+`silu` and `gnorm` fusions replace the whole MLP down-projection and GDN output-projection with opaque custom ops,
+and their small-row branch is what decode and verify run:
+- `gnorm`: the op ran `RMSNormGated.forward_static` **eagerly** on decode rows. Inductor can't see inside the
+  op, so that was about ten elementwise launches per GDN layer (48 layers). The per-token config runs one
+  compiled kernel there. This was the step-time cost.
+- `silu`: `torch.ops._C.silu_and_mul`, one launch like the stock path, so no time cost. But it rounds SiLU(gate)
+  before the multiply, and it differed from the per-token config's compiled `SiluAndMul` in nearly every
+  element of decode-sized rows (tier-1 probe `fx-silu`).
+
+Fix (e87aa84, 6392623): decode-size rows of both fusions run one Triton launch each, `w4a8_triton.gnorm` and
+`w4a8_triton.silu_mul`, with forward_static's arithmetic order and one rounding. Against the compiled stock ops
+(probes `fx-decodeops`, `fx-silu`, 1-128 rows): gnorm differs in 0-60 of 6,144 x M elements, as much as eager
+forward_static itself differs from inductor's; silu_mul differs in 0-176 of 17,408 x M elements (`_C`: about
+4,600 x M). So decode is now the per-token config's decode up to exp/sigmoid ulps, not bit-identical. Prefill
+rows (> 128) are untouched.
+
+| run (same session where paired) | step p50 4 users | step p50 1 user | cold 63K |
+|---|---:|---:|---:|
+| F g64, before (`t2-fx-F-g64lp`) | 56.1 ms | 42.8 ms | 1,973 tok/s |
+| F g64, fixed (`t2-fx-Ffix`) | **54.4 ms** | **41.3 ms** | 1,972 tok/s |
+| F per-token scales (`t2-fx-F-pt2`) | 54.6 ms | 41.3 ms | 2,045 tok/s |
+
+Prefill logprobs (`lpcheck.py`, 40 cuts of 1.5K-43K tokens): g64 before vs g64 fixed gives KL median 0.00135, mean
+0.0045, top-1 40/40. That is about 20 times below this stack's start-to-start noise (qual a1 vs a2: median 0.027).
+The QualityBench verdict for g64 stands.
+
+### 2. The first warm 4-user round is no longer slow (`K8V4_WARMUP_WARM_PREFIX=1`)
+
+py-spy (`--nonblocking --idle`, 200 Hz) on the EngineCore during the first and second 4-user warm rounds
+(`/root/k8v4work/fixfinal/dbg-fx-dbgwarm/`). In that run the first round took 4.28 s and the second 1.38 s. The
+first round alone pays:
+- Triton JIT of the K8/V4 prefill gather (`prefill_gather_triton._gather`) for a context length that is not a
+  multiple of 16 (the cold prefills only produced aligned lengths): about 1.2 s.
+- Triton JIT of the four deferred-commit kernels (`prepare_commit_plan`, `_defer_plan`, `compact_conv_state`,
+  `_commit_gdn_state`): about 1.0 s. A debug run logging the commit's specialization keys showed why vLLM's
+  warmup misses them. In the first round, requests arrive staggered, so the commit runs on a batch that mixes
+  prefilling and decoding requests. The spec requests' state slots are then a contiguous subset, a stride-1
+  Triton specialization. The draft depth is not the cause: `SPEC_QUERY_LEN` is 16 in every case.
+- A oneDNN SDPA kernel build for a 256-row query over a long unaligned context: 0.55-0.87 s (tier-1 probe
+  `fx-sdpaprobe`). Later lengths in the same class compile their partition in 0-7 ms.
+
+Fix (c6f9c61, 6a8ab04): `K8V4_WARMUP_WARM_PREFIX=1` (default 0; `launch.sh` passes it only when set, and the
+default command is unchanged). It is spliced into vLLM's `compile_or_warm_up_model` right after `warmup_kernels`.
+For every draft depth of the batch-size table (config F: 4 requests x depth 3, 1 request x depth 15), it runs that
+many requests with a 100-token turn on a 63,000-token cached context (garbage KV, like vLLM's
+`run_context_prefill_warmup`). One request prefills alone, the others prefill in a step where it already decodes,
+then all of them decode. Outputs are discarded, so serving is bit-identical. `K8V4_WARMUP_WARM_PREFIX_CTX`
+overrides the context length. Startup grows by 2.6 s (7.1 s on a start that also JIT-compiles the rotation
+kernels).
+
+| run | warm TTFT N=4, round 1 / 2 / 3 |
+|---|---|
+| F, fix 1 only (`t2-fx-Ffix`) | 2.28 / - / - s (rounds 2-3 of earlier runs: 1.30-1.33) |
+| + warmup, first version (`t2-fx-Ffixwarm`) | 1.65 / 1.31 / 1.28 s (commit kernels still compiled in round 1) |
+| + warmup, staggered (`t2-fx-final-norot`) | **1.32 / 1.33 / 1.30 s** |
+
+The `_gather` JIT for short prompts still happens on the first EXACT request after start. Warmup does not
+target it, since it is not in the warm multi-user path.
+
+### 3. Hadamard-rotated V (`K8V4_KV_ROTATE=v`, from `b70/kv-drift` 80de737 + 94adf73 + docs ea3683a)
+
+Cherry-picked as 22d613c, c7d020d, dd34b0c. The only conflicts were the `Xe2K8V4Impl.__init__` fields (kept both
+`_draft_lastrow` and the rotation flags) and the launch-test file. The query/output rotation sits in
+`Xe2K8V4Impl.forward` around both the packed (decode, cascade) and eager (prefill) paths, so it covers every
+attention call on this branch.
+
+| run | step p50 4 users | step p50 1 user | cold 63K | warm TTFT N=4 r1 |
+|---|---:|---:|---:|---:|
+| F + both fixes + warmup (`t2-fx-final-norot`) | 54.3 ms | 41.3 ms | 1,966 | 1.32 s |
+| same + `K8V4_KV_ROTATE=v` (`t2-fx-final`) | 55.1 ms (+1.5%) | 42.1 ms (+1.9%) | 1,937 | 1.34 s |
+
+KV pool unchanged (496,630 tokens). lpcheck against the bf16-KV references of the KV-drift agent (`kv-bG1` /
+`kv-bO1`, `--kv-cache-dtype=auto`):
+- F g64 fixed, unrotated: median KL 0.0057 / 0.0056, max 8.2 / 8.0, top-1 35 / 36 of 40.
+- With `KV_ROTATE=v`: median KL 0.0034 / 0.0031, max 1.5 / 0.22, top-1 37 / 37 of 40.
+
+The 8-nat flip is gone. The step cost here is a little above the KV-drift agent's +0.6% / +1.1% (single starts).
+
+Config F after these fixes adds `K8V4_WARMUP_WARM_PREFIX=1` and, if the quality gain is worth about 1.5% decode
+time, `K8V4_KV_ROTATE=v`.
+
 ## Files
 
 - Window `/root/k8v4work/win-final.sh` (log `/root/k8v4work/win-final.log`), build `/root/k8v4work/bld-final.sh`
