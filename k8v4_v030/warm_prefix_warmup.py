@@ -1,19 +1,20 @@
 """Optional startup warmup of the warm-prefix multi-user path (``K8V4_WARMUP_WARM_PREFIX``).
 
 Measured reason (config F, one B70, 2026-11-20): the first round of 4 users sending a new turn on warm ~63K
-prefixes took 1.8-3.7 s to the first token, every later round 1.30-1.33 s. vLLM's own JIT warmup
-(``warmup_kernels``) prefills short prompts from an empty prefix and decodes them at the configured maximum draft
-depth only, so serving pays, inside that first round:
+prefixes took 2.3-4.3 s to the first token, every later round 1.30-1.37 s. vLLM's own JIT warmup
+(``warmup_kernels``) prefills short prompts from an empty prefix, all requests in one step, so serving pays,
+inside that first round (py-spy, --nonblocking):
+  - the Triton JIT of the K8/V4 prefill gather for a long context whose length is not a multiple of 16 (~1.2 s);
+  - the Triton JIT of the deferred-commit kernels for a batch that mixes prefilling and decoding requests (the
+    spec requests' state slots are then a contiguous subset, a stride-1 specialization; ~1.0 s);
   - the oneDNN SDPA kernel for a short query over a long cached context (``libk8v4_sdpa.so`` builds one per
-    shape class, 0.55-0.68 s; later context lengths of the class reuse it in ~6 ms);
-  - the Triton JIT of the speculative-decode commit kernels at the draft depth of 2-4 users
-    (``num_speculative_tokens_per_batch_size``; ``SPEC_QUERY_LEN`` is a compile-time constant), which the
-    warmup never ran.
+    shape class, 0.55-0.87 s; later context lengths of the class reuse it in ~6 ms).
 With ``K8V4_WARMUP_WARM_PREFIX=1`` (default 0: startup unchanged) startup runs, for every draft depth of the
-batch-size table (or the one configured depth), one prefill of that many requests on a long cached context
-(garbage KV, as vLLM's ``run_context_prefill_warmup`` does) followed by a few decode steps at that depth, through
+batch-size table (or the one configured depth), that many requests with a new turn on a long cached context
+(garbage KV, as vLLM's ``run_context_prefill_warmup`` does), arriving staggered as in a first multi-user round
+(one prefills alone, the rest prefill while it decodes, then all decode at that depth), through
 the worker's real ``execute_model`` / ``sample_tokens``. Nothing is kept; serving results are bit-identical.
-Called from vLLM's ``kernel_warmup`` (KV cache allocated, before graph capture).
+Called from vLLM's ``compile_or_warm_up_model`` right after its ``warmup_kernels`` (before graph capture).
 """
 
 from __future__ import annotations
@@ -87,43 +88,53 @@ def _run_one(model_runner, execute_model, sample_tokens, num_reqs: int, depth: i
     req_ids = ["_k8v4_warm_prefix_%d_%d_" % (depth, i) for i in range(num_reqs)]
     tokens = vw._warmup_token_ids(model_runner, ctx + QUERY_LEN)
     held = [[block_count(ctx + QUERY_LEN, s) for s in specs] for _ in req_ids]
-    prefill = SchedulerOutput.make_empty()
-    prefill.num_spec_tokens_to_schedule = depth
-    prefill.scheduled_new_reqs = [
-        NewRequestData(req_id=rid, prompt_token_ids=tokens, mm_features=[],
-                       sampling_params=SamplingParams(temperature=0.0, max_tokens=64), pooling_params=None,
-                       block_ids=tuple(alloc(n) for n in held[i]), num_computed_tokens=ctx, lora_request=None,
-                       prefill_token_ids=tokens)
-        for i, rid in enumerate(req_ids)
-    ]
-    prefill.num_scheduled_tokens = dict.fromkeys(req_ids, QUERY_LEN)
-    prefill.total_num_scheduled_tokens = num_reqs * QUERY_LEN
+    computed = [ctx] * num_reqs
+    started = []
+
+    def step(new: list[int]) -> None:
+        """One step: the started requests decode `depth` drafts deep, the `new` ones prefill their turn."""
+        out = SchedulerOutput.make_empty()
+        out.num_spec_tokens_to_schedule = depth
+        out.scheduled_new_reqs = [
+            NewRequestData(req_id=req_ids[i], prompt_token_ids=tokens, mm_features=[],
+                           sampling_params=SamplingParams(temperature=0.0, max_tokens=64), pooling_params=None,
+                           block_ids=tuple(alloc(n) for n in held[i]), num_computed_tokens=ctx, lora_request=None,
+                           prefill_token_ids=tokens)
+            for i in new
+        ]
+        cached = CachedRequestData.make_empty()
+        cached.req_ids = [req_ids[i] for i in started]
+        cached.num_computed_tokens = [computed[i] for i in started]
+        cached.num_output_tokens = [1] * len(started)
+        cached.new_block_ids = []
+        for i in started:
+            after = [block_count(computed[i] + depth + 1, s) for s in specs]
+            delta = [a - h for a, h in zip(after, held[i])]
+            cached.new_block_ids.append(tuple(alloc(max(d, 0)) for d in delta) if any(delta) else None)
+            held[i] = [max(a, h) for a, h in zip(after, held[i])]
+        out.scheduled_cached_reqs = cached
+        sched = {req_ids[i]: depth + 1 for i in started}
+        sched.update({req_ids[i]: QUERY_LEN for i in new})
+        out.num_scheduled_tokens = sched
+        out.scheduled_spec_decode_tokens = {req_ids[i]: [0] * depth for i in started} if depth else {}
+        out.total_num_scheduled_tokens = sum(sched.values())
+        vw._run_step(execute_model, sample_tokens, out)
+        for i in started:
+            computed[i] += depth + 1
+        for i in new:
+            computed[i] += QUERY_LEN
+        started.extend(new)
+
+    # Requests arrive as in a first multi-user round: one turn prefills alone, the rest prefill in a step where
+    # it already decodes (the mixed commit takes the spec requests' state slots as a contiguous subset, a
+    # separate Triton specialization), then all of them decode.
+    phases = [[0]] + ([list(range(1, num_reqs))] if num_reqs > 1 else []) + [[]] * DECODE_STEPS
     model_runner.kv_connector.set_disabled(True)
     steps = 0
     try:
-        vw._run_step(execute_model, sample_tokens, prefill)
-        steps += 1
-        computed = [ctx + QUERY_LEN] * num_reqs
-        for _ in range(DECODE_STEPS):
-            cached = CachedRequestData.make_empty()
-            cached.req_ids = list(req_ids)
-            cached.num_computed_tokens = list(computed)
-            cached.num_output_tokens = [1] * num_reqs
-            cached.new_block_ids = []
-            for i in range(num_reqs):
-                after = [block_count(computed[i] + depth + 1, s) for s in specs]
-                delta = [a - h for a, h in zip(after, held[i])]
-                cached.new_block_ids.append(tuple(alloc(max(d, 0)) for d in delta) if any(delta) else None)
-                held[i] = [max(a, h) for a, h in zip(after, held[i])]
-            out = SchedulerOutput.make_empty()
-            out.num_spec_tokens_to_schedule = depth
-            out.scheduled_cached_reqs = cached
-            out.num_scheduled_tokens = dict.fromkeys(req_ids, depth + 1)
-            out.scheduled_spec_decode_tokens = {rid: [0] * depth for rid in req_ids} if depth else {}
-            out.total_num_scheduled_tokens = num_reqs * (depth + 1)
-            vw._run_step(execute_model, sample_tokens, out)
+        for new in phases:
+            step(new)
             steps += 1
-            computed = [c + depth + 1 for c in computed]
     finally:
         cleanup = SchedulerOutput.make_empty()
         cleanup.finished_req_ids = set(req_ids)
@@ -133,7 +144,7 @@ def _run_one(model_runner, execute_model, sample_tokens, num_reqs: int, depth: i
 
 
 def maybe_warmup(worker) -> None:
-    """vLLM kernel_warmup hook: the warm-prefix multi-user path when K8V4_WARMUP_WARM_PREFIX=1."""
+    """compile_or_warm_up_model hook: the warm-prefix multi-user path when K8V4_WARMUP_WARM_PREFIX=1."""
     if not enabled():
         return
     import torch
